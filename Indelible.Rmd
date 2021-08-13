@@ -1,0 +1,1835 @@
+---
+title: "InDelible"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Introduction 
+
+This R notebook contains code used to generate all figures, tables, and numbers included in the 'InDelible' manuscript published in AJHG in 2021:
+
+<To Insert Citation>
+
+Please cite our publication if making use of this repository. 
+
+**Big Note on this Repository**
+
+Due to DDD patient protection concerns, some of this code **will not** be able to be run on downloading this repository. All files noted to be in the folder `../ProtectedData/` (e.g. `SNVs.intersected_ddg2p.tsv`) are NOT included in this repository and thus code which makes use of them will not work outside of the Wellcome Sanger Institute compute cluster. We have thus provided the code as an example of how we performed our analyses and not as a 1-click method to reproduce our results. We apologize for any inconvience caused in this regard.
+
+We do provide a compiled version of this document, run with both data provided as part of this repository and internal protected patient data: `Indelible.html`.
+
+# Setup
+
+```{r setup}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+
+## Quietly Load Libraries
+load.package <- function(name) {
+  suppressMessages(suppressWarnings(library(name, quietly = T, warn.conflicts = F, character.only = T)))
+}
+load.package("data.table")
+load.package("ggplot2")
+load.package("patchwork")
+load.package("stringr")
+load.package("randomForest")
+load.package("dplyr")
+load.package("tidyr")
+load.package("ROCR")
+load.package("cvAUC")
+load.package("readxl")
+load.package("GenomicRanges")
+load.package("trackViewer")
+load.package("ensemblVEP")
+load.package("intervals")
+load.package("extrafont")
+load.package("png")
+suppressMessages(suppressWarnings((font_import(pattern="[A/a]rial",prompt=FALSE))))
+
+theme <- theme(panel.background=element_rect(fill="white"),legend.position="none",line=element_line(size=1,colour="black",lineend="round"),axis.line=element_line(size=1),text=element_text(family="Arial",face="bold",colour="black"),axis.text=element_text(colour="black"),axis.ticks=element_line(size=1,colour="black"),axis.ticks.length=unit(.1,"cm"),strip.background=element_rect(fill="white"),axis.text.x=element_text(angle=45,hjust=1))
+
+## Default theme w/legend
+theme.legend <- theme + theme(legend.position="right")
+
+col.palette <- c("#5989B5",
+                 "#B77C0D",
+                 "#9B8766",
+                 "#7C9A81",
+                 "#86A5C4",
+                 "#C1B38D",
+                 "#5B6F5F",
+                 "#86531B",
+                 "#223C21",
+                 "#F4EDE8")
+```
+
+Credit to Vincent van Gogh for being an artistic genius and generating this colour profile in his painting "Bedroom in Arles (1889)":
+
+```{r plot colours, fig.height=6, fig.width=3, message=FALSE, warning=FALSE}
+
+col.pal.plot <- data.table(size=rep(1,length(col.palette)),col=col.palette)
+
+ggplot(col.pal.plot,aes(col,size,fill=col)) + geom_col(colour="black") + scale_fill_identity() + xlab("") + ylab("") + coord_flip() + theme + theme(line = element_blank(),axis.text.x=element_blank())
+```
+
+# Run InDelible - CRAM Set
+
+Using the `InDelible` program to call SVs in the 10K DDD freeze - Availible on a [github repository](https://github.com/HurlesGroupSanger/indelible).
+
+Installing according to instructions on github and running with the vr-runner LSF automator (customized for Indelible and available at the above github). This section is meant as simple instructions on roughly HOW we ran InDelible on DDD data. It is not meant as a verbatim walkthrough.
+
+```{bash final calls, eval=F}
+
+## Clone Indelible
+git clone https://github.com/eugenegardner/indelible.git
+
+## Install InDelible according to the README
+## And make sure to activate virtualenv for Indelible
+source ./indelible/venv/bin/activate
+
+## We have to generated a file for vr-runner that looks something like:
+# proband.cram  mum.cram  dad.cram
+
+## Setup vr-runner (if don't already have)
+## This will just clone the vr-runner source code into the indelible directory, but you can install it elsewhere.
+cd ./indelible/
+git clone https://github.com/VertebrateResequencing/vr-runner.git
+
+## Setup vr-runner ENV variables (see vr-runner docs)
+export DIR=./indelible/
+export PERL5LIB=$DIR/vr-runner/modules/:$PERL5LIB
+
+## Running indelible with vr-runner
+# Generate conf file for vr-runner:
+# Make sure to change ALL parameters to point to the correct files:
+# bams = list of bams made above
+# ref = reference genome.fa
+# config = config.yml
+# indelible = path to the main indelible.py script
+# database = path to the indelible db
+./indelible/vr_runner_scripts/run-indelible +sampleconf > my.conf
+
+## And then run the vr-runner script:
+# Good idea to run with something like nohup since this can take several days to get through if throttling N jobs
+# `retries -2` will cause any sample that fails more often than twice to just be dropped from subsequent analysis, rather than me having the manually go back and fix.
+# `+maxjobs 1000` is to be a courteous grid user ;)
+# `+loop 100` means vr-runner will sleep for 100 seconds and check which jobs finished/need to be sub'd.
+./indelible/vr-runner/scripts/run-indelible -o ./output/ +config my.conf +maxjobs 1000 +loop 100 +retries -2
+```
+
+# Retraining the Random Forest
+
+This section is _slightly_ out of order since it requires that the first few steps of Indelible are run (up to aggregate).
+
+We first generate a set of sites in order to retrain the RF model. The best way to do this is to randomly grab 2000 sites from all samples and then re-run the RF and look at the correlation of scores. In short we:
+
+1. Selected 2000 sites from all samples and did visual inspection.
+2. Collected a new test set and ran the forest and examined that for TP/FP in the sites predicted to be real.
+3. Trained a new forest based on this new deliniation of training data.
+4. And then repeat 2 & 3 until we hit a plateau where the RF is unable to distinguish truth from error (this is the active learning bit from the manuscript).
+
+In short, the final method used the tutorial provided at [Towards Data Science](https://towardsdatascience.com/active-learning-tutorial-57c3398e34d) for guidance, which uses a active learning model. The code is documented below and on the link, but in short the steps taken are:
+
+1. Randomly selected 2,000 sites from _all_ *.counts files
+2. Visualized all 2,000 sites with IGV and added an annotation column of what I (Eugene Gardner) thought truth was
+3. Ensured the class balance of TP/FP sites was even by selecting an identical number (~500) of FP sites
+4. Trained a RF with k sites (vary for testing purposes)
+5. Checked both validation and test data for how well the classifier worked and selected the k most 'unclassable' validation set data and added it to the training set
+6. Rinse and repeat until we reach a convergence point (which is where accuracy on the test set does not exceed 1%)
+
+Also generating figure(s) for the paper:
+
+* The RandomForest distribution
+* ROC curves for Sens/Spec
+* Effectiveness of iterative learning
+
+We do not provide code to generate the annotation files here as it is essentially useless to the end-user. The input to the randomForest below is the output from InDelible's 'Aggregate' command, except with an additional column 'annotation'. An example file is provided in both `rawdata/observation_data.DDD.17IX2019.txt` and in [InDelible's github repo](https://github.com/HurlesGroupSanger/indelible).
+
+## Run Active Learning
+
+This runs the iterative learning approach in R. I have translated this code into a scikit-learn randomForest in Python available as the 'Train' module.
+
+```{r Random Forest, fig.height=4, fig.width=6}
+
+## Function for actually running the RF
+run.rf <- function(train.data, validation.data, test.data, k) {
+  
+  rf <- randomForest(ind.form, data= train.data, importance = T)
+  predictions <- predict(rf, validation.data, type="prob")
+  validation.data[,c("prob_f","prob_t"):=list(predictions[,1],predictions[,2])]
+  validation.data[,diff.probs:=abs(prob_t - prob_f)]
+  
+  setkey(validation.data,diff.probs)
+  add.to.train <- validation.data[1:k]
+  max <- max(add.to.train[,prob_t])
+  min <- min(add.to.train[,prob_t])
+
+  add.to.train[,c("prob_t","prob_f","diff.probs"):=NULL]
+  train.data <- bind_rows(train.data,add.to.train)
+  validation.data <- validation.data[!row.num %in% add.to.train[,row.num]]
+  
+  test.data[,curr.pred.prob:=predict(rf,test.data, type = "prob")[,2]]
+  acc <- performance(prediction(test.data[,curr.pred.prob],test.data[,annotation]),"acc")
+  
+  current.perf <- acc@y.values[[1]][which.min(abs(acc@x.values[[1]] - 0.5))]
+  
+  return(list(train = train.data,
+              validation = validation.data,
+              perf = current.perf,
+              forest = rf))
+  
+}
+
+observation.data <- fread("rawdata/observation_data.DDD.17IX2019.txt")
+observation.data[,annotation:=factor(as.logical(annotation))]
+observation.data[,row.num:=.I]
+
+## Use the number of true calls to set out our even class balance:
+num.true <- nrow(observation.data[annotation==T])
+
+# This sets out our formula for our random forest 
+covars <- names(observation.data)
+covars <- covars[3:19]
+
+cov.string <- paste(covars, collapse=" + ")
+ind.form <- as.formula(paste("annotation", cov.string,sep=" ~ "))
+
+## Build seperate pools based on our hyperparameter, k
+run.active.learning <- function(k) {
+
+  observation.data.even <- data.table(bind_rows(sample_n(observation.data[annotation==F],num.true),observation.data[annotation==T]))
+  
+  train.data <- data.table(sample_n(observation.data.even,k))
+  used.rows <- c(train.data[,row.num])
+  
+  test.data <- data.table(sample_n(observation.data.even[!row.num %in% used.rows],k))
+  used.rows <- c(used.rows, test.data[,row.num])
+  
+  validation.data <- observation.data.even[!row.num %in% used.rows]
+  
+  ## Run the random forest until we hit our stopping parameter:
+  first.forest <- run.rf(train.data, validation.data, test.data, k)
+  
+  train.data <- first.forest$train
+  validation.data <- first.forest$validation
+  last.perf <- first.forest$perf
+  perf.diff <- 1.00
+  performance.tracker <- c(last.perf)
+  
+  while(perf.diff > 0.01 & nrow(validation.data) > k) {
+    
+    recursive.forests <- run.rf(train.data, validation.data, test.data, k)
+    
+    final.forest <- recursive.forests$forest
+    perf.diff <- abs(recursive.forests$perf - last.perf)
+    last.perf <- recursive.forests$perf
+    performance.tracker <- c(performance.tracker, last.perf)
+    train.data <- recursive.forests$train
+    validation.data <- recursive.forests$validation
+    
+  }
+  
+  test.data[,curr.pred.prob:=predict(final.forest,test.data,type = "prob")[,2]]
+  return(list(list(performance.tracker),list(test.data[,curr.pred.prob]),list(test.data[,annotation]),list(final.forest$importance[,"MeanDecreaseAccuracy"])))
+  
+}
+
+## Test how varying levels of K impact accuracy
+ks  <- c(20,30,40,50,60,75)
+iteration <- c(1:10)
+k.test <- data.table(crossing(k = ks, iteration = iteration))
+k.test[,c("perf","pred","actual","varImp"):=run.active.learning(k),by=1:nrow(k.test)]
+
+roc.curves <- data.table()
+
+get.avg<-function(perf) {
+
+  if (length(perf@alpha.values) != 0) 
+      perf@alpha.values <- lapply(perf@alpha.values, function(x) {
+          isfin <- is.finite(x)
+          x[is.infinite(x)] <- (max(x[isfin]) + mean(abs(x[isfin][-1] - 
+              x[isfin][-length(x[isfin])])))
+          x
+      })
+  for (i in 1:length(perf@x.values)) {
+      ind.bool <- (is.finite(perf@x.values[[i]]) & is.finite(perf@y.values[[i]]))
+      if (length(perf@alpha.values) > 0) 
+          perf@alpha.values[[i]] <- perf@alpha.values[[i]][ind.bool]
+      perf@x.values[[i]] <- perf@x.values[[i]][ind.bool]
+      perf@y.values[[i]] <- perf@y.values[[i]][ind.bool]
+  }
+
+  perf.sampled <- perf
+  alpha.values <- rev(seq(min(unlist(perf@alpha.values)), max(unlist(perf@alpha.values)), 
+    length = max(sapply(perf@alpha.values, length))))
+  for (i in 1:length(perf.sampled@y.values)) {
+    perf.sampled@x.values[[i]] <- approxfun(perf@alpha.values[[i]], 
+        perf@x.values[[i]], rule = 2, ties = mean)(alpha.values)
+    perf.sampled@y.values[[i]] <- approxfun(perf@alpha.values[[i]], 
+        perf@y.values[[i]], rule = 2, ties = mean)(alpha.values)
+  }
+  perf.avg <- perf.sampled
+  perf.avg@x.values <- list(rowMeans(data.frame(perf.avg@x.values)))
+  perf.avg@y.values <- list(rowMeans(data.frame(perf.avg@y.values)))
+  perf.avg@alpha.values <- list(alpha.values)
+  return(perf.avg)
+  
+}
+
+for (i in ks) {
+  
+  r <- k.test[k == i]
+  
+  avg.roc.cis <- ci.cvAUC(r[,pred],r[,actual],confidence=0.95)
+  r <- get.avg(performance(prediction(r[,pred],r[,actual]),"sens","spec"))
+  
+  tab <- data.table(spec = unlist(r@x.values), sens = unlist(r@y.values), auc = avg.roc.cis$cvAUC, auc.lower = avg.roc.cis$ci[1], auc.upper = avg.roc.cis$ci[2])
+  tab[,k:=i]
+  roc.curves <- bind_rows(roc.curves,tab)
+  
+}
+
+roc.curves[,k:=as.character(k)]
+
+# Do a regular 50% test/training and see how it does...
+standard.rf <- data.table()
+
+for (i in c(1:10)) {
+  
+  observation.data.even <- data.table(bind_rows(sample_n(observation.data[annotation==F],num.true),observation.data[annotation==T]))
+  
+  test.size <- as.integer(nrow(observation.data.even)*0.5)
+  
+  train.data <- data.table(sample_n(observation.data.even,test.size))
+  used.rows <- c(train.data[,row.num])
+  
+  test.data <- (observation.data.even[!row.num %in% used.rows])
+  
+  rf <- randomForest(ind.form, data = train.data, importance = T)
+  
+  test.data[,curr.pred.prob:=predict(rf,test.data, type = "prob")[,2]]
+  
+  res <- data.table(pred=list(test.data[,curr.pred.prob]),actual=list(test.data[,annotation]),varImp=list(rf$importance[,"MeanDecreaseAccuracy"]))
+  standard.rf <- bind_rows(standard.rf,res)
+  
+}
+
+roc <- get.avg(performance(prediction(standard.rf[,pred],standard.rf[,actual]),"sens","spec"))
+avg.roc.cis <- ci.cvAUC(standard.rf[,pred],standard.rf[,actual],confidence=0.95)
+
+tab <- data.table(spec = unlist(roc@x.values), sens = unlist(roc@y.values), auc = avg.roc.cis$cvAUC, auc.lower = avg.roc.cis$ci[1], auc.upper = avg.roc.cis$ci[2])
+tab[,k:="50% Training"]
+roc.curves <- bind_rows(roc.curves,tab)
+roc.curves[,k:=factor(k,levels=c("20","30","40","50","60","75","50% Training"))]
+
+labels <- unique(roc.curves[,c("k","auc","auc.lower","auc.upper")])
+setkey(labels,k)
+labels[,label:=paste0(k," - ",sprintf("%0.02f",auc)," ± ",sprintf("%0.02f",auc - auc.lower))]
+```
+
+### Covariate Importance
+
+We are just taking the random forest variant importance from above and generating error bars. Plotting is done below in 'Figures'.
+
+```{r Covariate Importance}
+## Make a single varImpPlot based on average:
+obj <- k.test[k==75][1,varImp]
+n <- names(obj[[1]])
+decreaseAcc <- data.table()
+for (i in c(1:10)) {
+  obj <- k.test[k==75][i,varImp]
+  add <- data.table(obj[[1]])
+  add[,names:=n]
+  add[,trial:=i]
+  add[,method:="active"]
+  decreaseAcc <- bind_rows(decreaseAcc,add)
+  
+  obj <- standard.rf[i,varImp]
+  add <- data.table(obj[[1]])
+  add[,names:=n]
+  add[,trial:=i]
+  add[,method:="regular"]
+  decreaseAcc <- bind_rows(decreaseAcc,add)
+  
+}
+
+meanAcc<-decreaseAcc[,list(mean(V1),sd(V1)),by=c("names","method")]
+setkey(meanAcc,V1)
+meanAcc[,names:=as.character(names)]
+
+readable.labels <- c("total 3' SRs < 5bp","total 5' SRs ≥ 5bp","total 5' SRs < 5bp","total 3' SRs ≥ 5bp","Sequence entropy ±20bp","Entropy of the longest SR sequence","Entropy of sequence -20bp","Total number of SRs < 5bp","Total number of SRs ≥ 5bp","Entropy of sequence +20bp","Number of reads with non-SR insertions","Depth of coverage","Number of reads with non-SR deletions","Mean sequence similarity of SRs","Total number of SRs","Mean MAPQ of reads","Mean SR quality")
+
+meanAcc[,names:=factor(names,levels=c(meanAcc[method=="active",names]),labels=readable.labels)]
+```
+
+## RF Score Distrubtion
+
+Here looking at the final score distribution in the actual ~13.5k samples.
+
+We generated this by simply running the command `awk '{print $23}'  output/*.scored > scores.txt`, where `output` is the directory where InDelible deposits it's output files. We have provided our actual score distribution from the paper in this directory as a histogram (due to size constraints) in .001 bins for reproducibility purposes (`rawdata/scores_hist.txt`). We only read the file in here, we use it make an actual figure in the 'Supplement' section.
+
+```{r final scores, fig.height=6, fig.width=10}
+
+scores <- fread("rawdata/scores_hist.txt",header = F)
+setnames(scores,names(scores),c("count","prob_Y"))
+scores[,bin:=cut(prob_Y,breaks=seq(0,1,by=0.05))]
+
+```
+
+# Filtering Calls
+
+This section (very briefly) documents our filtering methodology. We have provided a script that, if applied to a single or multiple *.denovo.tsv files will filter as we have done in our manuscript (`./scripts/prep_input.pl`). This code chunk is not meant to run, but is intended as an example of how we performed filtering. The resulting file was then annotated with various information and eventually became Table S2 in our final manuscript.
+
+```{bash New Filter, eval = F}
+
+ls output/*.denovo.tsv | perl -ane 'chomp $_; print "./scripts/prep_input.pl $_;\n";' > denovo.candidates.tsv
+
+```
+
+## MAF Database Distribution
+
+This just takes the maf distribution database included with the github release of InDelible and generates some information for figure purposes.
+
+### Load MAF Database and Set Variables
+
+```{r Load MAF database}
+
+indelible.db <- fread("rawdata/Indelible_db_10k.bed.gz")
+setnames(indelible.db, names(indelible.db), c("chr","pos","maf","AC","AP","mean.cov","otherBP","aln_mode","SVClass","size","dist","otherFound","isPrimary","variantCoord"))
+## Generate sliced factors:
+indelible.db[,cut.MAF:=cut(maf,breaks=1/(10^(0:5)))]
+indelible.db[,cov.cut:=cut(mean.cov, breaks = c(seq(0,100,by=10),max(mean.cov)), include.lowest = T)]
+indelible.db[,is.sv.resolved:=grepl("REALN|REPEAT",aln_mode,perl = T)]
+indelible.db[,length.cut:=cut(abs(size),breaks=c(0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
+indelible.db[,dummy:=1]
+
+```
+
+### Depth vs. MAF
+
+Compare ability to resolve SV type/size as a function of depth and MAF.
+
+```{r Depth v MAF, fig.height=5.5, fig.width=8}
+
+## MAF data:
+maf.counts <- indelible.db[,sum(dummy),by="cut.MAF"]
+maf.counts[,cut.MAF:=factor(cut.MAF,levels=maf.counts[,unique(cut.MAF)],labels = c("0.00001-0.0001", "0.0001-0.001", "0.001-0.01","0.01-0.1","0.1-1"))]
+
+## Mean coverage data
+cov.counts <- indelible.db[,sum(dummy),by="cov.cut"]
+setkey(cov.counts,"cov.cut")
+cov.counts[,cov.cut:=factor(cov.cut,levels=cov.counts[,unique(cov.cut)],labels = c("0-10","11-20","21-30","31-40","41-50","51-60","61-70","71-80","81-90","91-100","101+"))]
+
+## SV resolution as a factor of Coverage x MAF
+maf.prop.table <- data.table(table(indelible.db[,c("cov.cut","cut.MAF","is.sv.resolved")]))
+maf.prop.table <- data.table(pivot_wider(maf.prop.table,names_from=is.sv.resolved,values_from = N))
+setnames(maf.prop.table,c("FALSE","TRUE"),c("not.resolved","resolved"))
+maf.prop.table[,tot:=not.resolved + resolved]
+maf.prop.table[,prop:=(resolved/tot)*100]
+maf.prop.table[,cov.cut:=factor(cov.cut,levels=maf.prop.table[,unique(cov.cut)],labels = c("0-10","11-20","21-30","31-40","41-50","51-60","61-70","71-80","81-90","91-100","101+"))]
+maf.prop.table[,cut.MAF:=factor(cut.MAF,levels=maf.prop.table[,unique(cut.MAF)],labels = c("0.00001-0.0001", "0.0001-0.001", "0.001-0.01","0.01-0.1","0.1-1"))]
+```
+
+### Distribution in Genome
+
+Use the length of the reference chromosomes from the .fai file to get breakpoint density information.
+
+```{r Distribution, fig.height=6, fig.width=8}
+
+## Variants per chromosome
+hs <- fread("rawdata/hs37d5.fa.fai")
+setnames(hs,names(hs),c("chr","len","cuml.len","char.1","char.2"))
+hs <- hs[grepl("^[0-9,X,Y]{1,2}$", chr, perl = T)] # Get main chromosomes
+
+chr.counts <- indelible.db[,sum(dummy),by="chr"]
+chr.counts <- merge(hs,chr.counts,by="chr")
+setnames(chr.counts,"V1","n.var")
+
+r.sqr.n.var <- sprintf("%0.3f",summary(lm(n.var ~ len, data = chr.counts))$r.squared)
+```
+
+# Computational Benchmarking
+
+Here we document benchmarking. Tests fall into three different categories:
+
+* Speed/CPU/Memory usage - Use actual runtime/memory stats from using InDelible on DDD data
+* Recall/Specificity to gold-standard calls =  Will involve checking multiple algorithms (InDelible, GATK, Manta) against calls generated by Genome in a Bottle 
+* Sensitivity/Specificity to known diagnostic calls - Will involve checking sens/spec to known variants already within DECIPHER
+
+## Speed/Memory/CPU Testing
+
+Here I have used the vr-runner output (in ./vr-runner-output/.jobs/) which keeps track of mem & CPU time to plot each step and generate a cumulative time needed for the entire DDD dataset. The IDs provided in these files are deidentifed. Note that the figure needs some work after the fact as cumulative memory usage is calculated automatically (which isn't really relevant...).
+
+```{r plot usage, fig.height=5, fig.width=8}
+
+cpu_usage <- fread("rawdata/cpu_usage.txt")
+mem_usage <- fread("rawdata/mem_usage.txt")
+
+cpu_usage[,test:="cpu.time"]
+mem_usage[,test:="avg.mem"]
+
+usage <- rbind(cpu_usage,mem_usage)
+
+usage <- data.table(gather(usage,key="step",value="value",-sample_id,-test))
+
+usage[,step:=str_replace(step,"run_",""),by=1:nrow(usage)]
+
+blanks <- usage[is.na(value),sample_id]
+
+usage <- usage[!sample_id %in% blanks]
+usage[,value:=if_else(test=="cpu.time",value/60,value)]
+
+total.cpu.time <- usage[test=="cpu.time",sum(value),by="sample_id"]
+total.mem <- usage[test=="avg.mem",sum(value),by="sample_id"]
+setnames(total.cpu.time,c("V1"),c("value"))
+setnames(total.mem,c("V1"),c("value"))
+total.cpu.time[,test:="cpu.time"]
+total.cpu.time[,step:="Cumulative"]
+total.mem[,test:="avg.mem"]
+total.mem[,step:="Cumulative"]
+usage <- rbind(usage,total.cpu.time,total.mem)
+
+usage[,step:=factor(step,levels=c("fetch","aggregate","score","annotate","denovo","Cumulative"))]
+
+means <- usage[,mean(value),by=c("step","test")]
+
+do.sample <- function(n) {
+  
+  sums <- c()
+  for (i in c(1:100)) {
+    frame <- data.table(sample_n(usage[test=="cpu.time" & step == "Cumulative"],n))
+    sums <- c(sums,frame[,sum(value/60)])
+  }
+  
+  return(list(mean(sums),sd(sums)))
+  
+}
+
+sample <- data.table(n=c(1,2,3,4,5,6,7,8,9,10,20,50,100,200,500,1000,2000,5000,10000))
+
+sample[,c("mean","sd"):=do.sample(n),by=1:nrow(sample)]
+```
+
+## Variant Calling Benchmarking
+
+The code in this section is largely (other than R code to read in results) placed here for representative purposes and does not actually run here. To be able to run this code, five primary files need to be downloaded:
+
+1. SNV / InDel calls for HG002 from [Zook et al. (2016)](https://www.nature.com/articles/sdata201625) -- HG002_GRCh37_1_22_v4.1_draft_benchmark.vcf.gz
+2. Large variant calls for HG002 from [Zook et al. (2020)](https://www.nature.com/articles/s41587-020-0538-8) -- HG002_SVs_Tier1_v0.6.filtered.vcf.gz
+3. SureSelect baits for the Illumina kit used during WES of HG002 -- SureSelect_baits_padded.v2.bed
+4/5. HG002 primary WES [.bam/bai files](ftp://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/data/AshkenazimTrio/HG002_NA24385_son/OsloUniversityHospital_Exome/151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam) -- 151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam
+
+### Possible Regions
+
+Downloaded SureSelectv8 padded regions (based off of methods of GIAB benchmark paper) and high quality regions for both SNVs/InDels and SVs.
+
+```{bash filter, eval = F}
+
+## Filter out bad regions:
+bedtools intersect -a ../SureSelect_baits_padded.bed.gz -b HG002_SVs_Tier1_v0.6.bed > ../SureSelect_baits_padded.v1.bed
+bedtools intersect -a ../SureSelect_baits_padded.v1.bed -b HG002_GRCh37_1_22_v4.1_draft_benchmark.bed > ../SureSelect_baits_padded.v2.bed
+```
+
+### InDelible
+
+Running InDelible using default settings.
+
+```{bash indelible, eval = F}
+
+## This is just to say that InDelible was run with default settings and then use the filtering script prep_input.pl in the indelible/ folder
+## This script does identical filtering to standard EXCEPT it removes the MAF, exonic, and DDG2P filters:
+./scripts/prep_input.benchmark.pl HG002.indelible.denovo.tsv > HG002.indelible.denovo.filtered.tsv
+
+## Also filtered variants down to bait regions:
+perl -ne 'chomp $_; @F = split("\t", $_); if ($F[1] == 0) {splice(@F, 2, 0, $F[1] + 1);} else {splice(@F, 1, 0, $F[1] - 1);} print join("\t", @F) . "\n";' HG002.indelible.denovo.filtered.tsv > HG002.indelible.denovo.filtered.bed
+bedtools intersect -a HG002.indelible.denovo.filtered.bed -b ../SureSelect_baits_padded.bed > HG002.indelible.denovo.filtered.baits.bed
+
+```
+
+### Manta
+
+Run Manta using default settings as well.
+
+```{bash manta, eval = F}
+
+manta-1.6.0.centos6_x86_64/bin/configManta.py --bam 151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam --referenceFasta hs37d5.fa --runDir manta/ --callRegions=SureSelect_baits_padded.bed --exome
+
+./runWorkflow.py
+
+bcftools query -f "%CHROM\t%POS\t%END\t%SVLEN\n" diploidSV.vcf.gz > diploidSV.bed
+```
+
+### GATK
+
+Commands used to run GATK on HG002. Using commands by the [DeepVariant paper](https://academic.oup.com/bioinformatics/article/36/24/5582/6064144#supplementary-data)
+
+```{bash gatk, eval = F}
+
+## Haplotype Caller
+gatk --java-options -Xmx10G HaplotypeCaller -R hs37d5.fa -I 151002_7001448_0359_AC7F6GANXX_Sample_HG002-EEogPU_v02-KIT-Av5_AGATGTAC_L008.posiSrt.markDup.bam -O gatk/HG002.g.vcf.gz -ERC GVCF --native-pair-hmm-threads 4 -L SureSelect_baits_padded.bed
+
+## GenotypeGVCFs
+gatk --java-options -Xmx10G GenotypeGVCFs -R /lustre/scratch115/projects/ddd/users/eg15/indelible/Indelible/data/resources_striped/hs37d5.fa -V gatk/HG002.g.vcf.gz -O gatk/HG002.vcf.gz
+
+## Filtering:
+bcftools norm -m - HG002.vcf.gz -Oz -o HG002.norm.vcf.gz
+bcftools index HG002.norm.vcf.gz
+bcftools view -i "TYPE='indel' && GQ > 20 && FORMAT/DP >= 7 && (GT='het' || GT ='hom')" -Oz -o HG002.norm.indels.filtered.vcf.gz HG002.norm.vcf.gz
+bcftools index HG002.norm.indels.filtered.vcf.gz 
+
+bcftools query -f "%CHROM\t%POS\t%END\t%REF\t%ALT\n" HG002.norm.indels.filtered.vcf.gz > HG002.norm.indels.filtered.bed
+../intersect_breakpoints.py HG002.norm.indels.filtered.bed > HG002.norm.indels.filtered.baits.bed
+
+```
+
+### Generate Useable Benchmarks
+
+Note that the python script necessary to perform this step is included in the `scripts/` folder. This just gets the benchmarks generated by GIAB into a useable form for matching alleles.
+
+```{bash intersect, eval = F}
+
+## Variants < 50bp
+bcftools norm -m - HG002_GRCh37_1_22_v4.1_draft_benchmark.vcf.gz -Oz -o HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.vcf.gz
+bcftools index HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.vcf.gz
+bcftools view -i "TYPE='indel' && ABS(ILEN) < 50" -Oz -o HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.vcf.gz HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.vcf.gz
+bcftools index HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.vcf.gz
+# Convert to bed of breakpoints for intersect
+bcftools query -f "%CHROM\t%POS\t%END\t%REF\t%ALT\n" HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.vcf.gz > HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.bed
+./scripts/intersect_breakpoints.py HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.bed > HG002_GRCh37_1_22_v4.1_draft_benchmark.norm.filtered.baits.bed
+
+## SVs:
+bcftools view -i "ABS(ILEN) >= 50 && GT='ALT'" -Oz -o HG002_SVs_Tier1_v0.6.filtered.vcf.gz HG002_SVs_Tier1_v0.6.vcf.gz
+bcftools index HG002_SVs_Tier1_v0.6.filtered.vcf.gz
+# Convert to bed of breakpoints for intersect
+bcftools query -f "%CHROM\t%POS\t%END\t%REF\t%ALT\n" HG002_SVs_Tier1_v0.6.filtered.vcf.gz > HG002_SVs_Tier1_v0.6.filtered.bed
+./scripts/intersect_breakpoints.py HG002_SVs_Tier1_v0.6.filtered.bed > HG002_SVs_Tier1_v0.6.filtered.baits.bed
+
+```
+
+### Allele Matching
+
+Note that the python script necessary to perform this step is included in the `scripts/` folder. This will just match each callset to the GIAB benchmarks to generated the files used in the next chunk.
+
+```{bash allele matching, eval = F}
+
+./benchmark.py indelible/HG002.indelible.denovo.filtered.baits.bed > results/indelible.tsv
+./benchmark.py gatk/HG002.norm.indels.filtered.bed > results/gatk.tsv
+./benchmark.py manta/results/variants/diploidSV.bed > results/manta.tsv
+
+```
+
+### Loading Final Data
+
+Here we just read in the benchmarks themselves to generate information plotted later in Figure S2.
+
+```{r stats, fig.height=6, fig.width=10}
+
+gatk.bench <- fread("rawdata/benchmark/gatk.tsv")
+indelible.bench <- fread("rawdata/benchmark/indelible.tsv")
+manta.bench <- fread("rawdata/benchmark/manta.tsv")
+
+setnames(gatk.bench,names(gatk.bench),c("chrom","start","end","len","found","type"))
+setnames(indelible.bench,names(indelible.bench),c("chrom","start","end","len","found","type"))
+setnames(manta.bench,names(manta.bench),c("chrom","start","end","len","found","type"))
+
+gatk.bench[,caller:="GATK"]
+indelible.bench[,caller:="InDelible"]
+manta.bench[,caller:="Manta"]
+
+break.orig <- c(20,100,300,10000,1000000000)
+
+bench.table <- rbind(gatk.bench[type == "REF"], indelible.bench[type == "REF"], manta.bench[type == "REF"])
+bench.table[,length.upper.cut:=cut(len,breaks=break.orig)]
+bench.table[,length.lower.cut:=cut(len,breaks=rev(-1*break.orig), right = F)]
+break.levels <- c(levels(bench.table[,length.lower.cut]),levels(bench.table[,length.upper.cut]))
+bench.table[,length.cut:=if_else(is.na(length.upper.cut), as.character(length.lower.cut), as.character(length.upper.cut))]
+bench.table[,length.cut:=factor(length.cut,levels = break.levels)]
+
+bench.table[,dummy:=1]
+
+summ <- bench.table[found == T,sum(dummy),by=c("caller","length.cut")]
+setnames(summ,"V1","found")
+poss <- bench.table[caller == "GATK",sum(dummy),by="length.cut"]
+setnames(poss,"V1","poss")
+
+result <- merge(summ,data.table(crossing(length.cut = break.levels,caller = c("GATK","InDelible","Manta"))),by=c("length.cut","caller"),all.y=T)
+result[,found:=if_else(is.na(found), 0, found)]
+result <- merge(result,poss,by="length.cut")
+result[,prop:=100*(found/poss)]
+result[,length.cut:=factor(length.cut,levels=break.levels)]
+
+## Look at recall compared to InDelible:
+del.recall <- data.table(pivot_wider(bench.table[!is.na(length.lower.cut),sum(dummy),by=c("found","caller")],names_from = found,id_cols = caller,values_from = V1))
+del.recall[,class:="del"]
+del.recall[,prop.indelible:=(`TRUE` / del.recall[caller == "InDelible",`TRUE`]) * 100]
+ins.recall <- data.table(pivot_wider(bench.table[!is.na(length.upper.cut),sum(dummy),by=c("found","caller")],names_from = found,id_cols = caller,values_from = V1))
+ins.recall[,class:="ins"]
+ins.recall[,prop.indelible:=(`TRUE` / ins.recall[caller == "InDelible",`TRUE`]) * 100]
+recall <- rbind(del.recall,ins.recall)
+
+```
+
+## Clinical Benchmarking
+
+### Raw InDelible Filtering
+
+This simply reads in the manually created/curated table that was generated for the manuscript and generates various pieces of information throughout the manuscript.
+
+```{r filtering classes, fig.height=7, fig.width=5}
+indelible_hits <- data.table(read_excel("figures/Supplement/TableS2.xlsx", sheet = "InDelible Variants", skip = 1))
+
+indelible_hits[,Notes:=NULL]
+indelible_hits[,FILTER:=factor(FILTER)]
+indelible_hits[,`Breakpoint Right`:=as.integer(`Breakpoint Right`)]
+
+indelible_hits[,length.cut:=cut(Length,breaks=c(0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
+indelible_hits[,dummy:=1]
+## We treat duos as proband only for the purposes of the paper:
+indelible_hits[,CLASS:=if_else(CLASS == "proband_only" | CLASS == "trio", CLASS, "proband_only")]
+
+filter.counts <- indelible_hits[FILTER != "OTHERSIDE",sum(dummy),by=c("CLASS","FILTER")]
+filter.counts[,FILTER:=factor(FILTER,levels = c("FALSE POSITIVE","PARENTAL CONTRIBUTION","ANNOTATION ERROR","HIGH MAF","GNOMAD MAF","UNCERTAIN CONSEQUENCE","KNOWN","REPORT"),labels = c("False Positive","Inherited","Annotation Error","High DDD MAF","In gnomAD","Uncertain\nConsequence","Previously\nDetected","Novel"))]
+filter.counts[,CLASS:=factor(CLASS,labels=c("Proband Only","Trio"))]
+
+## Count both the total number of variants in both Trio + Proband Only and the Max value so we can set the text accordingly
+totals <- filter.counts[,list(sum(V1),max(V1)),by="FILTER"]
+setnames(totals,c("V1","V2"),c("Total","Max"))
+
+rects <- data.table(low = c(0.5,1.5,2.5),high=c(1.5,2.5,6.5), ymins = c(0,0,0), ymaxs = c(55,55,55), col = c(col.palette[4:6]))
+```
+
+### Variant Resolution
+
+Here we compare between manual and InDelible ascertained variation:
+
+```{r breakpoint/sv resolution}
+
+sv_accuracy <- indelible_hits[FILTER == "KNOWN" | FILTER == "REPORT",c("Putative SV Class","Variant Type","Putative Length","Length","Variant Coordinate","Putative Second Breakpoint","Breakpoint Left","Breakpoint Right")]
+setnames(sv_accuracy,names(sv_accuracy),c("put.SV","act.SV","put.LEN","act.LEN","put.left","put.right","act.left","act.right"))
+
+# correct putative left/right bps:
+sv_accuracy[,put.left:=as.integer(str_replace(put.left,"[0-9,X,Y]{1,2}:",""))]
+sv_accuracy[,put.right:=as.integer(str_replace(put.right,"[0-9,X,Y]{1,2}:",""))]
+
+correct.dir <- function(l, r) {
+  if (is.na(r)) {
+    return(list(l,r))
+  } else if (l < r) {
+    return(list(l,r))
+  } else {
+    return(list(r,l))
+  }
+}
+sv_accuracy[,c("put.left","put.right"):=correct.dir(put.left,put.right),by=1:nrow(sv_accuracy)]
+
+## Make sure matching for SV types is similar
+sv_accuracy[,put.SV.corr:=if_else(grepl("CMPLX_DEL",put.SV), "DEL",
+                              if_else(grepl("CMPLX_DUP",put.SV),"DUP",
+                                      if_else(grepl("INS_[ATCG]{2}",put.SV, perl=T) | grepl("INS_[ATCG]{1}$", put.SV, perl=T), "INS",
+                                              if_else(put.SV == "DEL","DEL",
+                                                      if_else(put.SV == "DUP","DUP",
+                                                              if_else(put.SV == "TRANSSEGDUP", "TRANSLOCATION",
+                                                                      if_else(grepl("L1",put.SV),"MEI",
+                                                                              if_else(grepl("Alu|7SL",put.SV,perl=T),"MEI",
+                                                                                      if_else(grepl("SVA",put.SV,perl=T),"MEI",
+                                                                                              if_else(grepl("INS",put.SV,perl=T),"MEI",
+                                                                                                      "UNK"))))))))))]
+## Add flag for Complex
+sv_accuracy[,is.complex:=grepl("CMPLX", put.SV)]
+
+## Compare BPs
+sv_accuracy[,left.diff:=abs(put.left - act.left)]
+sv_accuracy[,right.diff:=if_else(is.na(put.right),abs(put.left - act.right),abs(put.right - act.right))]
+```
+
+### Allele Matching Function
+
+This function is used for matching alleles between various datasets
+
+```{r Allele Matching Function}
+
+allele.match <- function(chr.d, start.d, end.d, len.d, chr.i, start.i, end.i, len.i) {
+  
+  if (is.na(chr.i)) {
+    return(F)
+  } else if (chr.i != chr.d) {
+    return(F)
+  } else if (len.d > 100 & len.i > 100) {
+    
+    ints <- Intervals(matrix(c(start.d,start.i,end.d,end.i),ncol=2))
+    intersect <- interval_intersection(ints)
+    if (nrow(intersect@.Data) == 1) {
+      return(T)
+    } else {
+      return(F)
+    }
+    
+  } else {
+    
+    size.dif <- abs(len.d - len.i)
+    if (size.dif >= 50) {
+      return(F)
+    } else if (end.d < (start.i - 20) | start.d > (end.i + 20)) {
+      return(F)
+    } else {
+      return(T)
+    }
+    
+  }
+  
+}
+
+```
+
+### Sensitivity to DECIPHER Calls
+
+I am testing sensitivity by looking at all reported DDD variants in DECIPHER with a length > 1. This data dump is **NOT** provided as part of this repository due to patient protection concerns. The code here is thus provided as an example of how we performed filtering and allele matching. Just to note, the original data dump was filtered to genes that were directly assessed in this study.
+
+A few weird things were corrected in this file:
+
+* Due to clincians performing PCR on parents who were not WESed to validate inheritance, some proband_only samples have a non-Unknown inheritance. I have fixed this by changing all DECIPHER variants from a proband_only to "Unknown".
+* The ARID2 L1 from our [2019 MEI paper](https://www.nature.com/articles/s41467-019-12520-y) and (strangely) the ARID2 segdup/translocation do not match to anything in decipher for weird reasons. I have corrected them manually in the code.
+* For practical reasons I have set _de novo_ mosaics as _de novo_, as I think these were likely confirmed via PCR and do not represent how they were called by the algorithm.
+* Some of variants from the [2018 DDD Paper](https://www.nature.com/articles/gim2017246) were added to DECIPHER. As such, I have corrected that here as they wouldn't be there in the first place without InDelible (this is also stated explicitly in the main text).
+* Here, I only want variants > 1 bp in length for analysis purposes.
+
+```{r sensitivity to decipher, fig.height=5, fig.width=11}
+
+## Load curated DECIPHER variants:
+decipher.dump <- fread("../ProtectedData/SNVs.intersected_ddg2p.tsv")
+
+## Get samples which actually ran through InDelible and add useable IDs:
+all_samples <- fread("../ProtectedData/samples.txt")
+
+## Restrict to samples that were analysed in this study
+decipher.dump <- decipher.dump[person_stable_id %in% all_samples[,person_stable_id]]
+
+## Add length and dummy variable
+decipher.dump[,length:=if_else(ref_allele == "",
+                               end - start,
+                               abs(str_length(ref_allele) - str_length(alt_allele)))]
+decipher.dump[,dummy:=1]
+
+## Set a proband only flag
+decipher.dump[,in.trio:=person_stable_id %in% all_samples[is_proband_only == F,person_stable_id]]
+
+## Proband only samples need updating since some inheritance patterns have been updated manually by clincians and my logic is based off of no secondary followup. Fix that logic here!
+decipher.dump[,inheritance:=if_else(in.trio == F,"Unknown",inheritance)]
+
+## Add a flag for variants that we want for this specific analysis (leave decipher.dump alone for later):
+## * All variants > 1bp in length
+## * MNVs
+decipher.dump[,sens.var:=if_else((inheritance == "De novo constitutive" | inheritance == "Unknown" | inheritance == "De novo mosaic") & length != 0, T, F)]
+
+vars <- indelible_hits[(FILTER == "REPORT" | FILTER == "KNOWN") & !is.na(Length),c("ID","CHR","Breakpoint Left","Breakpoint Right","Length","FILTER", "In DECIPHER?","Variant Coordinate")]
+decipher.dump <- merge(decipher.dump,vars,by.x="person_stable_id",by.y="ID",all.x=T)
+
+## Check for actual allele match:
+decipher.dump[,called:=if_else(sens.var == T, allele.match(chrom,start,end,length,CHR,`Breakpoint Left`,`Breakpoint Right`,Length), F),by=1:nrow(decipher.dump)]
+
+## Get rid of variants already reported to DECIPHER (as these were sent by InDelible as novel sites...):
+decipher.dump <- decipher.dump[!label2 %in% decipher.dump[FILTER == "REPORT" & called == T,label2]]
+
+ggplot(decipher.dump[sens.var == T & length >= 5 & length <= 100],aes(length,fill=called)) + geom_histogram(binwidth=1) + scale_x_continuous(name="Variant Length",limits = c(5,100),breaks=c((1:20)*5)) + scale_y_continuous("Number of DECIPHER variants") + scale_fill_manual(values=col.palette) + theme.legend
+
+decipher.dump[,length.cut:=cut(length,breaks=c(0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
+
+sens <- decipher.dump[sens.var == T,sum(dummy),by=c("length.cut")]
+sens.2 <- decipher.dump[sens.var == T & called == T,sum(dummy),by=c("length.cut")]
+sens.3 <- indelible_hits[(FILTER=="REPORT" | FILTER == "KNOWN"),sum(dummy),by="length.cut"]
+
+sens<-merge(sens, sens.2, by = "length.cut", all=T)
+sens<-merge(sens, sens.3, by = "length.cut", all=T)
+rm(sens.2, sens.3)
+
+setnames(sens,c("V1.x","V1.y","V1"),c("total.decipher","known","indelible"))
+sens[,known:=if_else(is.na(known),0,known)]
+sens[,indelible:=if_else(is.na(indelible),0,indelible)]
+sens[,total.decipher:=if_else(is.na(total.decipher),0,total.decipher)]
+
+## Fix numbers for ARID2 MEI from Gardner et al. (which isn't in DECIPHER YET)!
+sens[length.cut=="(500,1e+04]",total.decipher:=total.decipher+1]
+sens[length.cut=="(500,1e+04]",known:=known+1]
+## THIS IS FOR ONE VARIANT IN PATIENT 292484. It is because it has unknown size but breaks my above code!
+sens[is.na(length.cut),total.decipher:=total.decipher+1]
+sens[is.na(length.cut),known:=known+1]
+sens[length.cut=="(1e+04,1e+09]",total.decipher:=total.decipher-1] ## This removes the 292484 variant from the wrong category.
+```
+
+### Sensitivity to CNV Calls Generated from WES
+
+Petr Danecek provided final WES _de novo_ calls from his soon to be announced manuscript.
+
+**Note:** As with the above section for SNVs/InDels from DECIPHER, we cannot make this data table publically available due to patient protection agreements. In the future, this data should be available via Danecek et al, but is now provided simply as an example.
+
+The goal of this section is to just add one column to 'WES.calls' (the CNV table) which indicates if the call is in my InDelible calls. The number should be 4 (based on manual curation) and all calls should already be known. I have similarly intersected calls to DDG2P genes that I care about like with the DECIPHER calls above.
+
+#### Load WES Calls
+
+```{r Petr WES}
+
+WES.calls <- fread("../ProtectedData/CNVs.intersected_ddg2p.tsv")
+WES.calls[,len.wes:=end-beg]
+
+matched.WES <- merge(WES.calls,indelible_hits[,c("True Coordinate","Variant Coordinate","ID","FILTER","CHR","Breakpoint Left","Breakpoint Right","Length")],by.x="person_stable_id",by.y="ID")
+matched.WES <- matched.WES[!is.na(`Breakpoint Right`)]
+matched.WES[,called.WES:=allele.match(chr,beg,end,len.wes,CHR,`Breakpoint Left`,`Breakpoint Right`,Length),by=1:nrow(matched.WES)]
+matched.WES <- matched.WES[called.WES==TRUE]
+
+WES.calls <- merge(WES.calls,matched.WES[,c("person_stable_id","Variant Coordinate")],by="person_stable_id",all.x=T)
+WES.calls[,called.indelible:=!is.na(`Variant Coordinate`)]
+
+## limit to individuals InDelible was used on.
+WES.calls <- WES.calls[person_stable_id %in% all_samples[,person_stable_id]]
+```
+
+#### Compare to DECIPHER
+
+```{r Add Exome Calls to DECIPHER}
+
+WES.decipher <- merge(WES.calls,decipher.dump[sens.var == T],by="person_stable_id")
+
+WES.decipher[,called.decipher:=allele.match(chr,beg,end.x,len.wes,chrom,start,end.y,length),by=1:nrow(WES.decipher)]
+setnames(WES.decipher,c("end.x"),c("end"))
+WES.decipher <- WES.decipher[called.decipher==T,c("person_stable_id","chr","beg","end","called.decipher")]
+WES.decipher <- unique(WES.decipher)
+
+WES.calls <- merge(WES.calls,WES.decipher[,c("person_stable_id","chr","beg","end","called.decipher")],by=c("person_stable_id","chr","beg","end"),all.x=T)
+WES.calls[,called.decipher:=if_else(is.na(called.decipher),F,T)]
+
+WES.calls[,length.cut:=cut(len.wes,breaks=c(0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
+WES.calls[,dummy:=1]
+WES.sens <- WES.calls[called.decipher==F,sum(dummy),by="length.cut"]
+sens <- merge(sens,WES.sens,by="length.cut",all.x=T)
+setnames(sens,"V1","wes.total")
+sens[,wes.total:=if_else(is.na(wes.total),0,wes.total)]
+sens[,total:=wes.total+total.decipher]
+```
+
+### Final Sensitivity
+
+Here we are collating/printing final sensitivity to other algorithms.
+
+```{r Sens/Spec plots}
+
+calc.running <- function(row.num) {
+  
+  sens[row <= row.num,sum(total)]
+  
+}
+
+sens[,sens:=known/total]
+sens[,row:=.I]
+sens[1,sens:=NA]
+v <- 1:nrow(sens) ## This is a bug. I have no idea why I have to do it this way.
+sens[,running.total:=calc.running(row),by=v]
+
+tot.vars <- sens[,sum(total)]
+tot.small <- sens[2:8,sum(total)]
+tot.large <- sens[14,total]
+
+print(paste0("Total number of Prev. Vars.     : ",tot.vars))
+print(paste0("Total number of ≤10bp InDels    : ",tot.small, " (",sprintf("%0.01f",(tot.small/tot.vars)*100),"%)"))
+print(paste0("Total number of large CNVs      : ",tot.large, " (",sprintf("%0.01f",(tot.large/tot.vars)*100),"%)"))
+
+print(paste0("Sensitivity ≤10bp               : ",sprintf("%0.01f",sens[2:8,sum(known)/sum(total)*100])))
+print(paste0("Peak sensitivity (51-100bp)     : ",sprintf("%0.01f",sens[!is.na(sens),max(sens)]*100)))
+print(paste0("# of variants 21-500bp          : ",sens[row >=10 & row <= 12,sum(indelible - known)]))
+print(paste0("% increase in variants 21-500bp : ",sprintf("%0.01f",(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100)))
+```
+
+### Trio vs Non-Trio Pathogenicity
+
+Simply collating if a variant was deemed pathogenic by our two senior clinicians.
+
+```{r trio vs nontrio}
+
+path.test <- matrix(c(nrow(indelible_hits[!is.na(`Is Pathogenic?`) & CLASS == "trio" & (`Is Pathogenic?` == T)]),
+                      nrow(indelible_hits[!is.na(`Is Pathogenic?`) & CLASS != "trio" & (`Is Pathogenic?` == T)]),
+                      nrow(indelible_hits[!is.na(`Is Pathogenic?`) & CLASS == "trio" & (`Is Pathogenic?` == F)]),
+                      nrow(indelible_hits[!is.na(`Is Pathogenic?`) & CLASS != "trio" & (`Is Pathogenic?` == F)])),
+                    nrow = 2, dimnames = list(c("trios","proband only"),c("Pathogenic","Non-Pathogenic")))
+
+fisher.test(path.test)
+```
+
+### Proband Only vs Trio Frame Difference
+
+Looking here at in-frame vs out-of-frame.
+
+```{r Frame, fig.height=2, fig.width=8}
+
+frame.table <- indelible_hits[(`Variant Type`=="DEL" | `Variant Type`=="DUP") & (FILTER == "KNOWN" | FILTER == "REPORT") & (Frame == "IF" | Frame == "OOF"),c("CLASS","Frame","Variant Type","Length","FILTER","dummy")]
+
+frame.table <- frame.table[,sum(dummy),by=c("CLASS","Frame")]
+
+frame.percent <- function(c) {
+  
+  return(frame.table[CLASS == c,sum(V1)])
+  
+}
+
+ci.func <- function(prop,total) {1.96*sqrt(((prop*(1-prop))/total))}
+
+frame.table[,cat.total:=frame.percent(CLASS),by=1:nrow(frame.table)]
+frame.table[,pct:=V1/cat.total]
+frame.table[,ci:=ci.func(pct,cat.total)]
+frame.table <- frame.table[Frame == "IF" | Frame == "OOF"]
+
+ft.table <- matrix(c(frame.table[CLASS=="proband_only" & Frame == "IF", V1],
+                     frame.table[CLASS=="trio" & Frame == "IF", V1],
+                     frame.table[CLASS=="proband_only" & Frame == "OOF", V1],
+                     frame.table[CLASS=="trio" & Frame == "OOF", V1]),
+                   nrow = 2,dimnames = list(c("proband_only","trio"),c("IF","OOF"))
+                   )
+
+prop.table(ft.table,margin=1)*100
+
+fisher.test(ft.table)
+```
+
+# MECP2 Variants
+
+Looking at the "enrichment" of SVs in MECP2 vs. called by InDelible
+
+## SNV vs SV loci
+
+```{r MECP2, fig.height=6, fig.width=14}
+
+decipher.dump[,mecp:=if_else(chrom == "X" & ((start > 153287024 & start < 153363212) |
+                                             (end > 153287024 & end < 153363212) |
+                                             (start < 153287024 & end > 153363212)), T, F)]
+
+decipher.mecp2 <- decipher.dump[in.trio == T & mecp == T & class == "de novo" & combined.consequence != "not protein altering" & end != 153296122]
+
+decipher.mecp2 <- decipher.mecp2[,c("chrom","start","end","person_stable_id","consequence")]
+setnames(decipher.mecp2,names(decipher.mecp2),c("chr","start","end","id","consequence"))
+decipher.mecp2[,consequence:=if_else(consequence == "" | consequence == "frameshift_variant","Deletion",consequence)]
+decipher.mecp2[,data_source:="decipher"]
+
+## I do known here because it is a previously published (Wright et al.) variant!
+indelible.mecp2 <- indelible_hits[DDG2P=="MECP2" & CLASS == "trio" & (FILTER == "REPORT" | FILTER == "KNOWN"), c("CHR","Breakpoint Left","Breakpoint Right","ID","Variant Type")]
+setnames(indelible.mecp2,names(indelible.mecp2),c("chr","start","end","id","consequence"))
+indelible.mecp2[,data_source:="indelible"]
+
+mecp2.denovos <- bind_rows(decipher.mecp2,indelible.mecp2)
+mecp2.denovos[,end:=ifelse(is.na(end),start,end)]
+mecp2.denovos[,consequence:=if_else(consequence=="DEL","Deletion",consequence)]
+mecp2.denovos[,colour:=if_else(consequence=="Deletion",col.palette[1],
+                               if_else(consequence=="SEGDUP",col.palette[4],
+                                       if_else(consequence=="COMPLEX",col.palette[3],
+                                               if_else(consequence=="stop_gained","black","grey"))))]
+
+## I have a seperate R script for building the gene model because it's massive:
+source("scripts/Plot_Lollipop.R")
+mecp2.model <- makeGeneModel(mecp2.denovos[consequence == "stop_gained" | consequence == "missense_variant"], mecp2.denovos[consequence != "stop_gained" & consequence != "missense_variant"])
+
+## This is just for a rough guide when actually making the plot in Figure 4 -- the scale is way off!
+mecp2.cnvs <- mecp2.model$cnvs
+mecp2.cnvs[,len:=end-start]
+mecp2.cnvs[,pos:=.I*0.5]
+setkey(mecp2.cnvs,len)
+mecp2.plot <- ggplot(mecp2.cnvs) + geom_rect(aes(xmin=Position.rel.f,xmax=End.rel.f,ymin=pos-0.2,ymax=pos+0.2,fill=colour),colour="black",size=1) + scale_x_continuous(limits = c(-5385,2084)) + theme + theme(axis.line=element_blank(),axis.ticks=element_blank(),axis.text=element_blank())
+mecp2.plot
+```
+
+## Identify PTVs in All Genes
+
+This code gives an output of gene totals for DECIPHER variants _not_ in the Kaplanis et al. manuscript. To be clear, what I have added together below are:
+
+2. DECIPHER variants
+3. WES CNVs _not_ in DECIPHER
+4. InDelible novel variants
+
+```{r MECP2 Comparison}
+
+## Remember that "" are cnvs
+consequences <- c("frameshift_variant","splice_acceptor_variant","splice_donor_variant","stop_gained","start_lost","")
+non.mecp2.denovos <- decipher.dump[in.trio == T & mecp == F & class == "de novo" & consequence %in% consequences]
+non.mecp2.denovos <- non.mecp2.denovos[is.na(mean_ratio) | mean_ratio < 0] ## only keep deletions
+non.mecp2.denovos <- non.mecp2.denovos[,c("chrom","start","end","person_stable_id","consequence")]
+setnames(non.mecp2.denovos,names(non.mecp2.denovos),c("chr","start","end","id","consequence"))
+non.mecp2.denovos[,consequence:=if_else(consequence == "", "deletion",consequence)]
+
+all.indelible <- indelible_hits[DDG2P!="MECP2" & CLASS == "trio" & FILTER == "REPORT", c("CHR","Breakpoint Left","Breakpoint Right","ID","Variant Type")]
+setnames(all.indelible,names(all.indelible),c("chr","start","end","id","consequence"))
+## This is a dummy variable just to get these large variants with breakpoints on other chromosomes into the "large" category
+all.indelible[,end:=if_else(is.na(end),start + 50.0,as.double(end))]
+
+## Don't need to worry about MECP2 variants here, there are none! Just getting any additiona WES CNVs
+all.cnvs <- WES.calls[type == "DEL" & called.decipher == F,c("chr","beg","end","person_stable_id","type")]
+setnames(all.cnvs,names(all.cnvs),c("chr","start","end","id","consequence"))
+
+non.mecp2.denovos <- rbind(non.mecp2.denovos, all.indelible, all.cnvs)
+non.mecp2.denovos[,length:=end - start]
+
+mecp2.denovos[,length:= end - start]
+
+non.mecp2.denovos[,length.cut:=cut(length,breaks=c(0,20,1e9),include.lowest = T)]
+mecp2.denovos[,length.cut:=cut(length,breaks=c(0,20,1e9),include.lowest = T)]
+
+non.mecp2.denovos[,list:="all"]
+mecp2.denovos[,list:="mecp2"]
+
+all.denovos <- rbind(non.mecp2.denovos,mecp2.denovos[consequence != "missense_variant",c("chr","start","end","id","consequence","length","length.cut","list")])
+all.denovos[,dummy:=1]
+
+all.denovos.ft <- all.denovos[,sum(dummy),by=c("length.cut","list")]
+
+ft.input <- data.table(pivot_wider(all.denovos.ft,values_from = V1,names_from = list))
+ft.matrix <- matrix(c(ft.input[length.cut=="[0,20]",mecp2],
+                     ft.input[length.cut=="[0,20]",all],
+                     ft.input[length.cut=="(20,1e+09]",mecp2],
+                     ft.input[length.cut=="(20,1e+09]",all]),
+                   nrow = 2,dimnames=list(c("mecp2","all"),c("<20","≥20")))
+
+print(paste0("Number of PTVs collated : ", sum(ft.matrix)))
+print(paste0("Number of PTVs < 20     : ", sum(ft.matrix[,1])," (", sprintf("%0.1f",(sum(ft.matrix[,1])/sum(ft.matrix))*100),"%)"))
+print(paste0("Proportion > 20bp MECP2 : ", sprintf("%0.1f",(ft.matrix[1,2]/sum(ft.matrix[1,]))*100)))
+print(paste0("Proportion > 20bp Other : ", sprintf("%0.1f",(ft.matrix[2,2]/sum(ft.matrix[2,]))*100)))
+print(paste0("Fold Increase for MECP2 : ", sprintf("%0.1f",(ft.matrix[1,2]/sum(ft.matrix[1,]))/(ft.matrix[2,2]/sum(ft.matrix[2,])))))
+print(paste0("P.value                 : ", sprintf("%0.1e",fisher.test(ft.matrix)$p.val)))
+
+```
+
+## Phenotypes of Carriers
+
+I manually collated phenotypes for all MECP2 SV carriers which overlap my identified locus from DECIPHER
+
+```{r phenotypes, fig.height=5, fig.width=8}
+
+mecp2.pheno <- data.table(read_excel("figures/Supplement/TableS3.xlsx", 
+    sheet = "A"))
+
+setnames(mecp2.pheno,names(mecp2.pheno),c("hpo.category","decipher.id","disease.category","hpo.super.category"))
+mecp2.indv <- unique(mecp2.pheno[,c("decipher.id","disease.category")])
+setkey(mecp2.indv,"disease.category")
+
+pheno.plot <- data.table(crossing(hpo.super.category=unique(mecp2.pheno[,hpo.super.category]),decipher.id=unique(mecp2.pheno[,decipher.id])))
+
+get.pheno <- function(p, id) {
+  
+  x <- nrow(mecp2.pheno[hpo.super.category==p & decipher.id == id,])
+  if (x > 0) {
+    return(1)
+  } else {
+    return(0)
+  }
+  
+}
+
+pheno.plot[,exists:=get.pheno(hpo.super.category,decipher.id),by=1:nrow(pheno.plot)]
+
+phenos <- pheno.plot[,sum(exists),by="hpo.super.category"]
+setkey(phenos,V1)
+
+pheno.plot <- merge(pheno.plot,mecp2.indv[,c("decipher.id","disease.category")],by="decipher.id")
+pheno.plot[,decipher.id:=factor(decipher.id,levels=c(mecp2.indv[,decipher.id]))]
+pheno.plot[,hpo.super.category:=factor(hpo.super.category,levels=c(phenos[,hpo.super.category]))]
+setkey(pheno.plot,"decipher.id","hpo.super.category")
+
+phenos <- pheno.plot[,sum(exists),by="hpo.super.category"]
+
+mecp2.indv[,decipher.id:=factor(decipher.id,levels=c(mecp2.indv[,decipher.id]))]
+```
+
+# Additive Potential of InDelible
+
+```{r additive potential, fig.height=3, fig.width=8}
+
+add.decipher <- decipher.dump[class == "de novo" & class2 == "de novo - LoF" & length <= 100 & in.trio == T]
+add.indelible <- indelible_hits[(FILTER == "REPORT" | FILTER == "KNOWN") & CLASS == "trio",c("ID","CHR","Breakpoint Left","Breakpoint Right","Length","FILTER", "In DECIPHER?","Variant Coordinate")]
+add.xhmm <- WES.calls[grepl("xhmm",called_by) & type == "DEL"]
+add.melt <- data.table(`Variant Coordinate` = c("12:46246309"))
+
+additive.table <- data.table(set = c("InDelible","InDelible + GATK","InDelible + GATK + XHMM","InDelible + GATK + XHMM + MELT"),
+                             InDelible=c(nrow(add.indelible),
+                                         nrow(add.indelible[!`Variant Coordinate` %in% add.decipher[!is.na(FILTER) & `In DECIPHER?` == T,`Variant Coordinate`]]),
+                                         nrow(add.indelible[!`Variant Coordinate` %in% add.decipher[!is.na(FILTER) & `In DECIPHER?` == T,`Variant Coordinate`] & !`Variant Coordinate` %in% add.xhmm[called.indelible == T,`Variant Coordinate`]]),
+                                         nrow(add.indelible[!`Variant Coordinate` %in% add.decipher[!is.na(FILTER) & `In DECIPHER?` == T,`Variant Coordinate`] & !`Variant Coordinate` %in% add.xhmm[called.indelible == T,`Variant Coordinate`] & !`Variant Coordinate` %in% add.melt[,`Variant Coordinate`]])),
+                             GATK=c(0,nrow(add.decipher[is.na(FILTER) | `In DECIPHER?` == F]),nrow(add.decipher[is.na(FILTER)| `In DECIPHER?` == F]),nrow(add.decipher[is.na(FILTER)| `In DECIPHER?` == F])),
+                             XHMM=c(0,0,nrow(add.xhmm),nrow(add.xhmm)),
+                             MELT=c(0,0,0,3))
+additive.table[,pct.indelible:=(InDelible / (InDelible + GATK + XHMM + MELT))*100]
+additive.table[,pct.xhmm:=(XHMM / (InDelible + GATK + XHMM + MELT))*100]
+additive.table[,y.indelible:=InDelible]
+additive.table[,y.xhmm:=InDelible + GATK]
+
+pct.table <- additive.table[,c("set","InDelible","XHMM","pct.indelible","pct.xhmm","y.indelible","y.xhmm")]
+setnames(pct.table,c("InDelible","XHMM"),c("n.indelible","n.xhmm"))
+pct.table <- data.table(pivot_longer(pct.table,cols = c("pct.indelible","pct.xhmm","y.indelible","y.xhmm","n.xhmm","n.indelible"),names_to=c(".value","algo"),names_patt = "(\\w+)\\.(\\w+)"))[pct>0]
+pct.table[,just:=if_else(algo=="indelible",0,1)]
+pct.table[,mod:=if_else(algo=="indelible",15,-15)]
+
+additive.table <- data.table(pivot_longer(additive.table[,c("set","InDelible","GATK","XHMM","MELT")],-set, names_to = "cat",values_to="count"))
+additive.table[,cat:=factor(cat, levels=c("MELT","XHMM","GATK","InDelible"))]
+```
+
+# Figures
+
+## Main Text
+
+### Figure 1
+
+Note: This was made completely in Illustrator and the raw PDF is located in `Figures/Figure1/`.
+
+### Figure 2
+
+#### Structural Variant Types
+
+```{r Figure 2 SV types, fig.height=8.5, fig.width=8.5}
+
+variant.types <- indelible_hits[(FILTER == "REPORT"),sum(dummy),by = "Variant Type"]
+setnames(variant.types,"Variant Type","sv.type")
+variant.types[,sv.type:=if_else(grepl("CMPLX_DEL",sv.type), "Complex-DEL/INS",
+                                       if_else(grepl("CMPLX_DUP",sv.type),"Complex-DUP/INS",
+                                               if_else(grepl("INSERTION",sv.type, perl=T), "Simple Ins.",
+                                                       if_else(sv.type == "DEL","Deletion",
+                                                               if_else(sv.type == "DUP","Duplication",
+                                                                       if_else(sv.type == "SEGDUP" | sv.type == "TRANSLOCATION", "Trans./Seg. Dup.",
+                                                                               if_else(grepl("L1",sv.type),"L1 MEI Ins.",
+                                                                                       if_else(grepl("ALU|7SL",sv.type,perl=T),"Alu MEI Ins.",
+                                                                                               if_else(grepl("SVA",sv.type,perl=T),"SVA MEI Ins.",
+                                                                                                       "Unknown")))))))))]
+variant.types <- variant.types[,sum(V1), by = "sv.type"]
+variant.types[,sv.type:=factor(sv.type,levels = c("Deletion","Duplication","Simple Ins.","Complex-DEL/INS","Complex-DUP/INS","Trans./Seg. Dup.","L1 MEI Ins.","Alu MEI Ins.","SVA MEI Ins."))]
+setkey(variant.types,"sv.type")
+variant.types[,cuml:=(V1 / 2) + variant.types[1:.I-1,sum(V1)],by=1:nrow(variant.types)] ## This gets cumulative counts
+variant.types[,prop:=(V1 / variant.types[,sum(V1)]) * 100]
+variant.types[,prop:=sprintf("%0.2f%%",prop)]
+variant.types[,label:=paste0(sv.type, " (",prop,")")]
+variant.types[,hjust:=c(0, 0.75, rep(1,4))]
+
+variant.type.plot <- ggplot(variant.types,aes(1,V1,fill=sv.type)) + 
+  geom_col(colour="black",size = 1,position=position_stack(reverse = T)) + 
+  geom_text(aes(x = 1, y = cuml, label = V1,hjust = hjust), vjust = 0.5, nudge_x = c(rep(0.55,7)), fontface = "bold",size=4) +
+  scale_x_discrete(name = "") +
+  scale_y_continuous(name = "") +
+  coord_polar(theta = "y", start = 0,clip = "off") + 
+  scale_fill_manual(guide = guide_legend(title = "SV Class"), values = col.palette[c(1:4,6,8)]) +
+  theme.legend + 
+  theme(axis.line.x=element_blank(),axis.line.y=element_blank(),axis.text.x=element_blank(),
+        plot.margin = unit(c(6,6,6,6), "cm"), legend.position = c(1.62,0.5))
+
+fig.2e <- plot_spacer() + variant.type.plot + plot_layout(nrow = 2, heights = c(1,10))
+fig.2e
+
+ggsave("figures/Figure2/circos/Figure2e.piechart.png", fig.2e, bg="transparent", height = 8.5, width = 8.5, dpi = 600)
+```
+
+#### Running Circos
+
+This code chunk takes care of generating the input files for circos:
+
+```{r generate circos input}
+
+per.gene <- indelible_hits[FILTER=="REPORT",sum(dummy),by=c("DDG2P","Variant Type")]
+setnames(per.gene,"Variant Type","sv.type")
+per.gene[,sv.type:=if_else(grepl("CMPLX_DEL",sv.type), "Complex-DEL/INS",
+                                       if_else(grepl("CMPLX_DUP",sv.type),"Complex-DUP/INS",
+                                               if_else(grepl("INSERTION",sv.type, perl=T), "Simple Ins.",
+                                                       if_else(sv.type == "DEL","Deletion",
+                                                               if_else(sv.type == "DUP","Duplication",
+                                                                       if_else(sv.type == "SEGDUP" | sv.type == "TRANSLOCATION", "Translocation/Seg. Dup.",
+                                                                               if_else(grepl("L1",sv.type),"L1 MEI Ins.",
+                                                                                       if_else(grepl("ALU|7SL",sv.type,perl=T),"Alu MEI Ins.",
+                                                                                               if_else(grepl("SVA",sv.type,perl=T),"SVA MEI Ins.",
+                                                                                                       "Unknown")))))))))]
+
+per.gene <- data.table(pivot_wider(per.gene,names_from=sv.type,values_from = V1,values_fill=0))
+per.gene[,counts:=paste(`Deletion`,`Duplication`,`Simple Ins.`,`Complex-DEL/INS`,`Translocation/Seg. Dup.`,`Alu MEI Ins.`,sep=",")]
+per.gene[,total:=`Deletion` + `Duplication` + `Simple Ins.` + `Complex-DEL/INS` + `Translocation/Seg. Dup.` + `Alu MEI Ins.`]
+per.gene <- per.gene[,c("DDG2P","counts","total")]
+
+hg19.genes <- fread("rawdata/hg19.all_genes_with_pli.txt")
+per.gene <- merge(per.gene,hg19.genes,by.x="DDG2P",by.y="V6")
+setnames(per.gene,names(per.gene),c("DDG2P","COUNT","TOTAL","ENSGID","CHR","START","END","HGNC","ENST","pLI"))
+per.gene[,CHR:=paste0("chr",CHR)]
+
+setkey(per.gene,CHR,START)
+# Scipen keeps from printing coordinates in scientific notation
+options(scipen=999)
+fixed <- data.table()
+last.pos <- 0
+last.chr <- "chrZ"
+
+for (i in 1:nrow(per.gene)) {
+  
+  current.rec <- copy(per.gene[i])
+
+  center <- as.integer((current.rec[,START] + current.rec[,END])/2)
+  chr <- current.rec[,CHR]
+    
+  # I want all genes to be 10mb
+  left <- center - 1500000
+  right <- center + 15000000
+  
+  if (left < 1) {
+    shift <- 0 - left
+    left <- 0
+    right <- right + shift
+  }
+  
+  if (left < last.pos & chr == last.chr) {
+    shift <- last.pos - left
+    left <- left + shift
+    right <- right + shift
+  }
+  
+  last.pos <- right + 2000000
+  last.chr <- chr
+  
+  center <- (left + right)/2
+  
+  current.rec[,START:=left]
+  current.rec[,END:=right]
+  current.rec[,CENTER:=center]
+  fixed <- bind_rows(fixed, current.rec)
+  
+}
+
+write.table(fixed[,c("CHR","START","END","COUNT")],"figures/Figure2/circos/gene_totals.txt",col.names=F,row.names=F,sep="\t",quote=F)
+write.table(fixed[TOTAL>1,c("CHR","CENTER","CENTER","DDG2P")],"figures/Figure2/circos/gene_names.txt",col.names=F,row.names=F,sep="\t",quote=F)
+
+## Reset scipen to 0 to print in scientific notation again
+options(scipen=0)
+```
+
+Have to copy paste this into the terminal due to PATH issues with circos
+
+```{bash run circos, eval = F}
+
+/Users/eg15/Applications/circos-0.69-6/bin/circos -conf /Users/eg15/Documents/Current\ Projects/Indelible/IndeliblePaper/figures/Figure2/circos/circos.conf 
+
+```
+
+#### Final Figure
+
+
+```{r Figure 2 sens/spec, fig.height=6, fig.width=8.5}
+
+plot.filtering <- ggplot(filter.counts,aes(FILTER,V1,group=CLASS,fill=CLASS)) + 
+  geom_rect(data = rects, inherit.aes = F, aes(xmin=low,xmax=high,ymin=ymins,ymax=ymaxs),fill=c("grey","darkgrey","black"),colour="black",linetype=2,alpha=0.3) +
+  geom_col(colour="black",size=1,position = position_dodge(preserve = "single")) +
+  scale_x_discrete(name = "") +
+  scale_y_continuous("Number of Variants",expand=c(0,0),limits = c(0,60)) +
+  scale_fill_manual(values=c(col.palette[4],col.palette[6]),guide=guide_legend(title = "Proband Class",title.position = "top",title.hjust=0.5,nrow=1)) + 
+  scale_alpha_continuous(range=c(0,1)) +
+  geom_text(inherit.aes=F,data = totals, aes(FILTER,Max + 5,label=Total),fontface="bold",size=5) +
+  coord_flip() +
+  theme.legend + 
+  theme(legend.position='bottom')
+
+sens.plot <- ggplot(sens,aes(length.cut,sens,group="")) +
+  geom_line() +
+  geom_point() +
+  scale_x_discrete(name="") +
+  scale_y_continuous("Sensitivity to\nDECIPHER Variants") + 
+  theme.legend + theme(axis.text.x=element_blank(),panel.grid.major.x=element_line(colour="grey",size=0.5),plot.margin=ggplot2::margin(0,0,0,0,"in"))
+
+tot.plot <- ggplot(sens,aes(length.cut,total,group="")) + 
+  geom_col(colour="black",fill=col.palette[1],size=0.5) + scale_x_discrete(name="") + 
+  scale_y_continuous("DECIPHER\nVariants",expand = c(0,0)) + 
+  theme.legend + theme(axis.text.x=element_blank(),panel.grid.major.x=element_line(colour="grey",size=0.5),plot.margin=ggplot2::margin(0,0,0,0,"cm"))
+
+sens.pivoted <- data.table(pivot_longer(sens,cols=c("total","known","indelible"),names_to="total",values_to="count"))[total!="total"]
+sens.pivoted[,total:=factor(total,levels=c("indelible","known"))]
+
+novel.plot <- ggplot(sens.pivoted,aes(length.cut,count,group=total,fill=total)) +
+  geom_col(colour="black",size=0.5) +
+  scale_x_discrete(name="Variant Length",labels=c("1","2","3","4","5","6","7-10","11-20","21-50","51-100","101-500","501-10,000","10,000+","Unknown")) +
+  scale_y_continuous("InDelible\nVariants",expand = c(0,0)) +
+  scale_fill_manual(values=c(col.palette[2],col.palette[3]),guide=guide_legend(title = ""),breaks=c("known","indelible"),labels=c("Known","Novel")) + 
+  theme.legend +
+  theme(panel.grid.major.x=element_line(colour="grey",size=0.5),plot.margin=ggplot2::margin(0,0,0,0,"cm"))
+
+figure.2.top <- (plot.filtering | (tot.plot / sens.plot / novel.plot) + plot_layout(heights=c(1,1.8,1))) + 
+  plot_layout(widths=c(1,1.2))
+figure.2.top
+
+ggsave("figures/Figure2/Figure2a-d.svg",figure.2.top,width=8.5,height=6,units="in")
+
+```
+
+
+### Figure 3
+
+#### MECP2 Other Variants
+
+This is the top of Figure 3 ('A' panel). It was heavily edited using Illustrator.
+
+```{r Figure 3a Lolliplot}
+
+pdf(paste("figures/Figure3/Figure3a.pdf",sep=""),width=14,height=6)
+lolliplot(mecp2.model$snvs, mecp2.model$features,ylab=NULL,dashline.col=c("#0000FF00"), cex = 1, yaxis=FALSE, xaxis=FALSE, rescale=c(1,1,0.2,1,0.2,1))
+dev.off()
+
+```
+
+
+#### MECP2 Phenotypes
+
+This generates the bottom part of Figure 3 (panel 'B').
+
+```{r Figure 3b phenotypes}
+
+disease.type <- ggplot(mecp2.indv) + geom_col(aes(decipher.id,y=1,fill=disease.category),colour="black") + xlab("") + ylab("") + scale_fill_manual(guide=guide_legend(title=NULL,nrow=2),values=col.palette) + theme.legend + theme(axis.text=element_blank(),axis.ticks=element_blank(),axis.line=element_blank(),legend.position="right",plot.margin=ggplot2::margin(-.5,-.5,-.5,-.5,"cm"))
+
+pheno.dots <- ggplot(pheno.plot,aes(decipher.id,hpo.super.category,alpha=exists)) + geom_point(size=4) + geom_vline(xintercept=c(1.5,3.5,5.5,7.5),size=0.5,linetype=2) + xlab("ID") + ylab("") + theme + theme(plot.margin=ggplot2::margin(-.5,-.5,0,-.5,"cm"))
+
+phenos <- pheno.plot[,sum(exists),by="hpo.super.category"]
+pheno.counts <- ggplot(phenos,aes(hpo.super.category,V1)) + geom_col() + xlab("") + scale_y_continuous("") + coord_flip() + theme + theme(axis.text.y=element_blank(),axis.ticks.y=element_blank(),plot.margin=ggplot2::margin(-.5,-.5,0,-.5,"cm"))
+
+figure.4b <- (disease.type + guide_area() + pheno.dots + pheno.counts) + plot_layout(guides='collect', heights=c(0.15,1),widths=c(1,0.3))
+figure.4b
+
+ggsave("figures/Figure3/Figure3b.pdf",figure.4b,width=8,height=5,units="in")
+
+```
+
+### Figure 4
+
+```{r Figure 4, fig.height=3, fig.width=8}
+
+additive.plot <- ggplot(additive.table,aes(set,count,group=cat,fill=cat)) + 
+  geom_col(size=0.5,colour="black",alpha = 0.5) + 
+  geom_text(data = pct.table,inherit.aes = F,aes(set,y+mod,label=paste0(n, " (", sprintf("%0.1f",pct),"%)"),hjust=just, colour = algo),fontface="bold") +
+  geom_hline(aes(yintercept = additive.table[set == "InDelible + GATK + XHMM + MELT",sum(count)]), linetype = 2, colour = "red", size = 1) +
+  coord_flip() + 
+  scale_x_discrete(name = "", limits = rev(c("InDelible","InDelible + GATK","InDelible + GATK + XHMM","InDelible + GATK + XHMM + MELT")), labels = rev(c("InDelible","InDelible + GATK","InDelible + GATK +\nXHMM","InDelible + GATK +\nXHMM + MELT"))) +
+  scale_y_continuous(name = "Total # of PTVs in Monoallelic\nDD Genes Among DDD Trios",breaks = c(0,400,800,1200,additive.table[set == "InDelible + GATK + XHMM + MELT",sum(count)]),expand=c(0,0),limits = c(0,1400)) +
+  scale_alpha_continuous(range = c(0,1)) +
+  scale_fill_manual(values = col.pal.plot[,col], guide = guide_legend(title = "Calling Algorithm")) +
+  scale_colour_manual(values = c("#7C9A81","#B77C0D"), guide = "none") +
+  theme.legend + theme(panel.grid.major.x=element_line(colour="grey",size=1), axis.text.y=element_text(hjust=0.5))
+additive.plot
+
+ggsave("figures/Figure4/Figure4.pdf",additive.plot,width=8,height=3,units="in")
+
+```
+
+## Supplement
+
+### Figures
+
+#### Figure 1
+
+```{r Supp Figure 1, fig.height=4, fig.width=6}
+
+supp.fig.1 <- ggplot(meanAcc[method=="active"],aes(names,V1,group=method,colour=method)) + geom_point(position=position_dodge(0.5)) + geom_errorbar(aes(ymin=V1-V2,ymax=V1+V2),width=0.5,position=position_dodge(0.5)) + coord_flip() + scale_colour_manual(values=col.palette) + xlab("") + ylab("Mean Decrease in Accuracy") + theme + theme(panel.grid.major.x=element_line(colour="grey",size=0.5))
+
+supp.fig.1
+
+ggsave("figures/Supplement/SuppFig1.png",supp.fig.1,height=4,width=6,units="in",dpi=600)
+
+```
+
+#### Figure 2
+
+```{r Supp Figure 2, fig.height=5, fig.width=8}
+
+mem.plot <- ggplot(usage[test=="avg.mem"],aes(step,value)) + 
+  geom_boxplot(size=0.5,outlier.size = 0.5, outlier.alpha = 0.1, fill = col.palette[1]) + 
+  scale_x_discrete(name="") + 
+  scale_y_log10(name="Avg. Mem. (MB)") + 
+  geom_text(data=means[test=="avg.mem"],aes(step,20000,label=sprintf("%0.1f Mb",V1)),size=3) +
+  theme + 
+  theme(panel.grid.major.y=element_line(colour="grey",size=0.5), axis.text.x=element_blank(),panel.grid.major.x=element_blank())
+
+cpu.plot <- ggplot(usage[test=="cpu.time"],aes(step,value)) + 
+  geom_boxplot(size=0.5,outlier.size = 0.5, outlier.alpha = 0.1, fill = col.palette[2]) + 
+  scale_x_discrete(name="InDelible Step") + 
+  scale_y_log10(name="CPU Time (m)") + 
+  geom_text(data=means[test=="cpu.time"],aes(step,200000,label=sprintf("%0.1f m.",V1)),size=3) + 
+  theme + 
+  theme(panel.grid.major.y=element_line(colour="grey",size=0.5),panel.grid.major.x=element_blank())
+
+cumulative.plot <- ggplot(sample,aes(n,mean)) + 
+  geom_point() + 
+  geom_line() + 
+  scale_x_log10(name="Number of Individuals") + 
+  scale_y_continuous(name="Cumulative Runtime (CPU hrs)") + 
+  theme + 
+  theme(panel.grid.major=element_line(colour="grey",size=0.5))
+
+supp.fig.2 <- ((mem.plot / cpu.plot) | cumulative.plot) + 
+  plot_layout(widths=c(1.6,0.8)) + plot_annotation(tag_levels = 'A')
+  
+ggsave("figures/Supplement/SuppFig2.png",supp.fig.2,width=8,height=5,units="in", dpi = 600)
+
+supp.fig.2
+
+```
+
+#### Figure 3
+
+```{r Supp Figure 3, fig.height=4, fig.width=8.5}
+
+sens.plot <- ggplot(result, aes(length.cut, prop, group = caller, colour = caller)) + 
+  geom_line(size = 1) +
+  geom_point(size = 2) + 
+  scale_x_discrete(name = "Element Length", labels = c("< -10,000", "-10,000 - -300", "-300 - -100", "-100 - -20", "20 - 100","100 - 300", "300 - 10,000", "> 10,000")) +
+  scale_y_continuous(expand=c(0,0), name = "Proportion of Sites Recovered") +
+  scale_color_manual(values=col.palette) +
+  theme + theme(panel.grid.major=element_line(size = 0.25, colour = "grey"))
+
+## FP
+fp.data <- data.table(n.tp = c(nrow(gatk.bench[found == T]),
+                               nrow(indelible.bench[found == T]),
+                               nrow(manta.bench[found == T])),
+                      n.fn = c(nrow(gatk.bench[found == F]),
+                               nrow(indelible.bench[found == F]),
+                               nrow(manta.bench[found == F])),
+                      n.fp = c(nrow(gatk.bench[type == "FP"]),
+                               nrow(indelible.bench[type == "FP"]),
+                               nrow(manta.bench[type == "FP"])),
+                      n.sites = c(2623,
+                                  1288,
+                                  61),
+                      caller = c("GATK","InDelible","Manta"))
+
+fp.data[,tp.rate:=n.tp/(n.fn + n.tp)]
+fp.data[,fp.rate:=n.fp/(n.sites)]
+fp.data[,fn.rate:=n.fn/(n.fn + n.tp)]
+
+fp.plot <- ggplot(fp.data,aes(n.sites,fp.rate, colour = caller)) + 
+  geom_point(size = 4) + 
+  scale_x_continuous(name = "# of Called Sites") +
+  scale_y_continuous(name = "False Positive Rate", limits = c(0,1)) +
+  scale_color_manual(guide = guide_legend(title = "Caller"),values=col.palette) +
+  theme.legend + theme(panel.grid.major=element_line(size = 0.25, colour = "grey"))
+
+supp.fig.3 <- sens.plot + fp.plot + plot_layout(widths = c(2,1), guides = 'collect') + plot_annotation(tag_levels = 'A')
+supp.fig.3
+
+ggsave("figures/Supplement/SuppFig3.svg",supp.fig.3,height=4,width=8.5,units="in",dpi=600)
+
+
+```
+
+#### Figure 4
+
+```{r Supp Figure 4, fig.height=6, fig.width=10}
+
+roc.plots <- ggplot(roc.curves,aes(sens,spec,group=k,colour=as.factor(k))) +
+  geom_path(size=1) + 
+  scale_color_manual(values=col.palette,guide=guide_legend(title="k",title.hjust = 0.5),breaks = c("20","30","40","50","60","75","50% Training"), labels=labels[,label]) +
+  geom_abline(intercept=1,slope=1, linetype=2) + 
+  scale_x_reverse(name = "Sensitivity") + 
+  scale_y_continuous(name = "Specificity") + 
+  theme.legend + theme(legend.position=c(0.75,0.3),legend.box.background=element_rect(fill="white",colour="black",size=0.6), panel.grid.major=element_line(colour="grey",size=0.5))
+
+## Make a bin of scores so we can plot:
+scores_hist <- scores[,sum(count),by=bin]
+setkey(scores_hist,bin)
+scores_hist[,place:=seq(0.05,1,by=0.05)] ## Just adding an actual number to make plotting easier
+scores_hist[,prop:=(V1 / scores_hist[,sum(V1)]) * 100]
+scores_hist[,row:=.I]
+scores_hist[,prop.cuml:=scores_hist[row<=.I,sum(prop)],by=1:nrow(scores_hist)] ## And calculate cumulative density as well
+
+plot.hist <- ggplot(scores_hist,aes(place,prop)) + 
+  geom_col(colour="black",fill=col.palette[6],size=1) + 
+  scale_y_continuous(name = "Percentage\nof All Calls", expand = c(0,0)) + 
+  scale_x_continuous(name = "",limits = c(0,1)) + 
+  geom_vline(xintercept=0.6,linetype=2,colour="red",size=1) + 
+  theme + theme(panel.grid.major=element_line(colour="grey",size=0.5),axis.text.x=element_blank())
+
+plot.cdf <- ggplot(scores_hist,aes(place,prop.cuml)) + 
+  geom_line(size=1) + 
+  geom_vline(xintercept=0.6,linetype=2,colour="red",size=1) + 
+  scale_x_continuous(name = "Probability of Being a Real Variant", limits=c(0,1)) + 
+  scale_y_continuous(name = "Cumulative Densitiy") + 
+  theme + theme(panel.grid.major=element_line(colour="grey",size=0.5))
+
+supp.fig.4 <- roc.plots | (plot.hist / plot.cdf) +
+  plot_layout(heights = c(1,3))
+
+supp.fig.4 <- supp.fig.4 + 
+  plot_annotation(tag_levels = 'A') + plot_layout(widths = c(1.5,1))
+  
+supp.fig.4
+
+ggsave("figures/Supplement/SuppFig4.png",supp.fig.4, width=10, height=6, units = "in", dpi = 600)
+
+```
+
+#### Figure 5
+
+```{r Supp Figure 5, fig.height=5.5, fig.width=8}
+
+MAF.plot <- ggplot(maf.counts, aes(cut.MAF,V1)) + 
+  geom_col(colour="black",fill=col.palette[1],size=1) + 
+  scale_x_discrete(name = "") + 
+  scale_y_log10(name = "Number of Clusters",expand=c(0,0),limits=c(1,2e6)) + 
+  theme + 
+  theme(panel.grid.major=element_line(colour="grey",size=0.5), axis.text.x = element_blank())
+
+COV.plot <- ggplot(cov.counts, aes(cov.cut,V1)) + 
+  geom_col(colour="black",fill=col.palette[2],size=1) + 
+  scale_x_discrete(name = "", labels = c("0-10","11-20","21-30","31-40","41-50","51-60","61-70","71-80","81-90","91-100","101+")) + 
+  scale_y_continuous(name = "Number of Clusters", expand = c(0,0)) +
+  coord_flip() +
+  theme + theme(axis.text.y = element_blank())
+
+SV.resolve.plot <- ggplot(maf.prop.table,aes(cut.MAF, cov.cut, fill = prop)) + 
+  geom_raster() + 
+  scale_x_discrete(name = "Cluster Frequency") + 
+  scale_y_discrete("Cluster Mean Coverage") + 
+  scale_fill_continuous(guide=guide_legend(title = "Proportion Clusters w/\nResolved Breakpoints")) + 
+  theme.legend
+SV.resolve.plot
+
+supp.fig.5 <- MAF.plot + guide_area() + SV.resolve.plot + COV.plot + plot_layout(ncol = 2, nrow = 2, widths = c(1,.5), heights = c(.5, 1)) + plot_layout(guides = "collect")
+supp.fig.5
+
+ggsave("figures/Supplement/SuppFig5.png", supp.fig.5, width = 8, height = 5.5, dpi = 600)
+
+```
+
+#### Figure 6
+
+```{r Supp Figure 6, fig.height=6, fig.width=8}
+
+chr.plot <- ggplot(chr.counts,aes(len,n.var)) + 
+  geom_smooth(method = "lm", se = FALSE, colour = "red", linetype = 2, size = 1) +
+  annotate("text", x = 2.3e8, y = 120000, label = bquote(r^2==.(r.sqr.n.var)), colour = "red", size = 6) +
+  geom_text(aes(label = chr), nudge_x = 3000000, nudge_y = 5000) +
+  geom_point(size = 2) + 
+  scale_x_continuous(name = "Chromosome Length") +
+  scale_y_continuous(name = "Number of Clusters") +
+  theme + theme(panel.grid.major.x = element_line(), panel.grid.major.y = element_line())
+chr.plot
+
+ggsave("figures/Supplement/SuppFig6.png", chr.plot, width = 8, height = 6, dpi = 600)
+
+```
+
+#### Figure 7
+
+```{r Supp Figure 7, fig.height=6, fig.width=7.5}
+## SV type plot:
+# Set more useable SV types:
+sv.types <- data.table(table(indelible.db[is.sv.resolved==T,SVClass]))
+sv.types[,sv.type:=if_else(grepl("CMPLX_DEL",V1), "Complex-DEL/INS",
+                           if_else(grepl("CMPLX_DUP",V1),"Complex-DUP/INS",
+                                   if_else(grepl("INS_[ATCG]{2}",V1, perl=T) | grepl("INS_[ATCG]{1}$", V1, perl=T), "Simple Ins.",
+                                           if_else(V1 == "DEL","Deletion",
+                                                   if_else(V1 == "DUP","Duplication",
+                                                           if_else(V1 == "TRANSSEGDUP", "Translocation/Seg. Dup.",
+                                                                   if_else(grepl("L1",V1),"L1 MEI Ins.",
+                                                                           if_else(grepl("Alu|7SL",V1,perl=T),"Alu MEI Ins.",
+                                                                                   if_else(grepl("SVA",V1,perl=T),"SVA MEI Ins.",
+                                                                                           "Other Unclassified Repetitive Ins.")))))))))]
+
+sv.counts <- sv.types[,sum(N),by=sv.type]
+sv.counts[,sv.type:=factor(sv.type,levels = c("Deletion","Duplication","Simple Ins.","Complex-DEL/INS","Complex-DUP/INS","Translocation/Seg. Dup.","L1 MEI Ins.","Alu MEI Ins.","SVA MEI Ins.","Other Unclassified Repetitive Ins."))]
+setkey(sv.counts,"sv.type")
+sv.counts[,cuml:=as.integer((V1 / 2) + sv.counts[1:.I-1,sum(V1)]),by=1:nrow(sv.counts)] ## This gets cumulative counts
+sv.counts[,prop:=(V1 / sv.counts[,sum(V1)]) * 100]
+sv.counts[,prop:=sprintf("%0.2f%%",prop)]
+sv.counts[,label:=paste0(sv.type, " (",prop,")")]
+sv.counts[,hjust:=c(0, 0.5, rep(1,8))]
+
+type.plot <- ggplot(sv.counts,aes(1,V1,fill=sv.type)) + 
+  geom_col(colour="black",size = 1,position=position_stack(reverse = T)) + 
+  geom_text(aes(x = 1, y = cuml, label = label,hjust = hjust), vjust = 0.5, nudge_x = c(rep(0.55,7),0.7,0.85,1)) +
+  geom_segment(aes(x = 1.45, y = 193415, xend = 1.65, yend = 193415)) +
+  geom_segment(aes(x = 1.45, y = 195874, xend = 1.80, yend = 195874)) +
+  geom_segment(aes(x = 1.45, y = 198051, xend = 1.95, yend = 198051)) +
+  scale_x_discrete(name = "") +
+  scale_y_continuous(name = "") +
+  coord_polar(theta = "y", start = 0,clip = "off") + 
+  scale_fill_manual(guide = guide_legend(title = "SV Class"),values = col.palette) +
+  theme + 
+  theme(axis.line.x=element_blank(),axis.line.y=element_blank(),axis.text.x=element_blank())
+
+type.plot
+
+ggsave("figures/Supplement/SuppFig7.png", type.plot, width = 7.5, height = 6, dpi = 600)
+
+```
+
+#### Figure 8
+
+```{r Supp Figure 8, fig.height=4, fig.width=6}
+
+## Resolved length plot:
+size.plot <- ggplot(indelible.db[is.sv.resolved==T], aes(length.cut)) + 
+  geom_histogram(stat="count",colour = "black", fill = col.palette[3], size = 1) + 
+  scale_x_discrete(name="Variant Length",labels=c("1","2","3","4","5","6","7-10","11-20","21-50","51-100","101-500","501-10,000","10,000+","Unknown")) + 
+  scale_y_continuous(name = "Number of Clusters") +
+  theme
+size.plot
+
+ggsave("figures/Supplement/SuppFig8.png", size.plot, width = 6, height = 4, dpi = 600)
+
+```
+
+#### Figure 9
+
+```{r Supp Figure 9, fig.height=2, fig.width=8}
+
+supp.fig.9 <- ggplot(frame.table,aes(CLASS,pct,group=interaction(Frame,CLASS),colour=Frame)) + 
+  geom_point(position=position_dodge(width=0.5)) + 
+  geom_errorbar(aes(ymin=pct-ci,ymax=pct+ci),width=0.1,position=position_dodge(0.5)) + 
+  scale_colour_manual(values=col.palette) + 
+  coord_flip() + 
+  scale_x_discrete(labels=c("Proband Only","Trio"),name="") + 
+  ylab("Proportion of InDels <=50bp") + 
+  theme.legend + theme(panel.grid.major.x=element_line(colour="grey",size=0.5))
+
+ggsave("figures/Supplement/SuppFig9.png",supp.fig.9,height=2,width=8,units="in",dpi=600)
+
+supp.fig.9
+
+```
+
+### Data / Tables
+
+All Supplementary Data / Tables reported as part of this manuscript were generated manually.
+
+# Numbers Catalogue
+
+```{r}
+
+## Sprintf decimal precision:
+sp.format <- "%0.1f"
+
+## Summary
+paste0("----Summary----")
+paste0("Number of novel variants identified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]))
+paste0("Number of novel clinical actionable: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & `Is Pathogenic?` == T]) , "/",
+       nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]))
+paste0("% increase in variants 21-500bp : ",sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100))
+paste0("# of MECP2 variants: ", nrow(mecp2.denovos[data_source == "indelible"]))
+paste0("Proportion of MECP2 LoF variants IDd by InDelible: ", sprintf(sp.format, (nrow(mecp2.denovos[data_source == "indelible"])/nrow(mecp2.denovos[consequence != "missense_variant"])) * 100))
+paste0("")
+
+## Computational Benchmarking
+paste0("----Comp. Benchmark----")
+print(paste0("Time for 1,000 trios : ", sprintf("%0.0f",sample[n == 1000, mean])))
+print(paste0("Time for 1,000 trios 100 core cluster : ", sprintf(sp.format,sample[n == 1000, mean]/100)))
+paste0("")
+
+## GIAB Benchmark
+paste0("----GIAB Benchmark----")
+paste0("Recall del for GATK: ", sprintf(sp.format,recall[caller == "GATK" & class == "del", prop.indelible]))
+paste0("Recall del for Manta: ", sprintf(sp.format,recall[caller == "Manta" & class == "del", prop.indelible]))
+paste0("Recall ins for GATK: ", sprintf(sp.format,recall[caller == "GATK" & class == "ins", prop.indelible]))
+paste0("Recall ins for Manta: ", sprintf(sp.format,recall[caller == "Manta" & class == "ins", prop.indelible]))
+paste0("")
+
+## Raw InDelible Data
+paste0("----Raw InDelible Data----")
+tot.vars <- nrow(indelible.db)
+ac.1.vars <- nrow(indelible.db[AC==1])
+total.pass <- indelible.db[,sum(AC)]
+
+total.raw <- fread("rawdata/total_raw_sites.txt")
+total.raw[,V1:=V1-1] ## This is because totals count the header!
+total.raw.sites <- total.raw[,sum(V1)]
+
+print(paste0("Total raw (redundant) sites : ", total.raw.sites))
+print(paste0("Number of redudant sites    : ", total.pass, " (",sprintf(sp.format,(total.pass/total.raw.sites)*100),")"))
+print(paste0("Number of overall loci      : ", tot.vars))
+print(paste0("Number of AC = 1 loci       : ", ac.1.vars, " (",sprintf(sp.format,(ac.1.vars/tot.vars)*100),")"))
+paste0("")
+
+paste0("----Breakpoint Ascertainment----")
+paste0("r2 correlation chrom len x num vars: ", r.sqr.n.var)
+paste0("Number of variants with resolved BPs: ", nrow(indelible.db[grepl("FAIL",aln_mode) == F]), " (", 
+       sprintf(sp.format,100*(nrow(indelible.db[grepl("FAIL",aln_mode) == F]) / nrow(indelible.db))) , "%)")
+paste0("Prop DEL/DUP: ", sprintf(sp.format, 100 * (nrow(indelible.db[grepl("FAIL",aln_mode) == F & SVClass == "DEL" | SVClass == "DUP"]) / nrow(indelible.db[grepl("FAIL",aln_mode) == F]))), "%")
+paste0("Number resolved: ", nrow(sv_accuracy[put.SV.corr != "UNK"]), "/", nrow(sv_accuracy), " (", sprintf(sp.format, nrow(sv_accuracy[put.SV.corr != "UNK"]) / nrow(sv_accuracy) * 100), "%)")
+paste0("")
+
+## Started mid-way through, need to add rest:
+paste0("----Candidate Variant Filtering----")
+paste0("Number of Clusters: ", nrow(indelible_hits))
+paste0("Number of Candidates: ", nrow(indelible_hits[FILTER != "OTHERSIDE"]))
+paste0("Number of Parental Contribution: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "PARENTAL CONTRIBUTION"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (", 
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "PARENTAL CONTRIBUTION"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Annotation Errors: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "ANNOTATION ERROR"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (",
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "ANNOTATION ERROR"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Number of False Positives: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "FALSE POSITIVE"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (", 
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "FALSE POSITIVE"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Four samples contribute ", sprintf(sp.format, 100*(sum(sort(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "FALSE POSITIVE", `ID`]),decreasing = T)[1:4])/sum(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "FALSE POSITIVE", `ID`])))), "% of false positives.")
+
+paste0("Number of gnomAD DDD MAF: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "GNOMAD MAF"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (", 
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "GNOMAD MAF"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Number of High DDD MAF: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "HIGH MAF"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (", 
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "HIGH MAF"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Number of intron/UTR: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "UNCERTAIN CONSEQUENCE"]), "/", nrow(indelible_hits[FILTER != "OTHERSIDE"]), " (",
+       sprintf(sp.format, 
+               100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "UNCERTAIN CONSEQUENCE"]) / nrow(indelible_hits[FILTER != "OTHERSIDE"]))),
+       "%)")
+paste0("Total number of remaining variants for assessment: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & (FILTER == "KNOWN" | FILTER == "REPORT")]))
+paste0("Number trio variants: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & (FILTER == "KNOWN" | FILTER == "REPORT") & CLASS == "trio"]))
+paste0("Number of non-trio variants: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & (FILTER == "KNOWN" | FILTER == "REPORT") & CLASS != "trio"]))
+paste0("")
+
+paste0("----Sensitivity to DECIPHER----")
+paste0("Number of plausibly pathogenic variants in DECIPHER: ",sens[,sum(total)])
+paste0("Total number of ≤10bp InDels    : ",tot.small, " (",sprintf(sp.format,(sens[2:8,sum(total)]/sens[,sum(total)])*100),"%)")
+paste0("Total number of large CNVs      : ",tot.large, " (",sprintf(sp.format,(sens[14,total]/sens[,sum(total)])*100),"%)")
+paste0("Sensitivity ≤10bp               : ",sprintf(sp.format,sens[2:8,sum(known)/sum(total)*100]), "%")
+paste0("Peak sensitivity (51-100bp)     : ",sprintf(sp.format,sens[!is.na(sens),max(sens)]*100))
+paste0("# of variants 21-500bp          : ",sens[row >=10 & row <= 12,sum(indelible - known)])
+paste0("% increase in variants 21-500bp : ",sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100))
+paste0("Number of variants reidentified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "KNOWN"]))
+paste0("Number of novel variants identified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]))
+paste0("")
+
+paste0("---Pathogenic Variants----")
+paste0("Number of simple DEL/DUP: ", data.table(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT",`Variant Type`]))[V1 == "DEL" | V1 == "DUP",sum(N)], 
+       "/", 
+       data.table(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT",`Variant Type`]))[,sum(N)], 
+       " (", 
+       sprintf(sp.format,data.table(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT",`Variant Type`]))[V1 == "DEL" | V1 == "DUP",sum(N)] / data.table(table(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT",`Variant Type`]))[,sum(N)] * 100), 
+       ")")
+paste0("Number of de novo vars: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT" & CLASS == "trio"]))
+paste0("Number of novel variants 21-500bps: ", sens[row >=10 & row <= 12,sum(indelible - known)], " (prop of all variants: ", sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible-known)]/sens[,sum(indelible-known)]) * 100), ")")
+paste0("% increase in variants 21-500bp : ",sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100))
+paste0("Number of variants not returned: ", nrow(indelible_hits[FILTER == "REPORT" & `CLINICAL?` == "DNR"]), " (", sprintf(sp.format,100*(nrow(indelible_hits[FILTER == "REPORT" & `CLINICAL?` == "DNR"])/ nrow(indelible_hits[FILTER == "REPORT"]))), "%)")
+paste0("Number of variants PCRd: ", nrow(indelible_hits[`PCR Validated?` == T & `PCR Validation` == "Validated" & `CLINICAL?` != "DNR"]))
+paste0("Number of de novos PCRd: ", nrow(indelible_hits[`PCR Validated?` == T & `PCR Validation` == "Validated" & CLASS == "trio" & `CLINICAL?` != "DNR"]))
+paste0("Number of pathogenic variants: ", nrow(indelible_hits[`Is Pathogenic?` == T]), "/", nrow(indelible_hits[FILTER == "REPORT" & `CLINICAL?` != "DNR"]), " (", sprintf(sp.format, 100 * (nrow(indelible_hits[`Is Pathogenic?` == T]) / nrow(indelible_hits[FILTER == "REPORT" & `CLINICAL?` != "DNR"]))), "%)")
+paste0("trio v. non-trio Fisher test: ", sprintf("%0.3f", fisher.test(path.test)$p.value))
+
+pt <- prop.table(ft.table,margin=1)*100
+
+paste0("Prop of variants in-frame non-trios: ", sprintf(sp.format,pt[1,1]))
+paste0("Prop of variants in-frame trios: ", sprintf(sp.format,pt[2,1]))
+paste0("Fisher Test p: ", sprintf("%0.1e",fisher.test(ft.table)$p.value))
+paste0("De novo variants IDd by InDelible: ", nrow(indelible_hits[FILTER == "REPORT" & CLASS == "trio" & `Is Pathogenic?` == T]), " (", sprintf(sp.format,100 * (nrow(indelible_hits[FILTER == "REPORT" & CLASS == "trio" & `Is Pathogenic?` == T]) / 2592)), "%)")
+paste0("")
+
+paste0("----MECP2 Variants----")
+paste0("# of MECP2 variants: ", nrow(mecp2.denovos[data_source == "indelible"]))
+paste0("Proportion of LoF variants from MECP2 IDd by InDelible: ", sprintf(sp.format, 100 * (nrow(mecp2.denovos[data_source == "indelible"])/ nrow(indelible_hits[FILTER == "REPORT" & CLASS == "trio"]))), " (",nrow(mecp2.denovos[data_source == "indelible"]), "/", nrow(indelible_hits[FILTER == "REPORT" & CLASS == "trio"]), ")")
+paste0("Proportion of MECP2 LoF variants IDd by InDelible: ", sprintf(sp.format, (nrow(mecp2.denovos[data_source == "indelible"])/nrow(mecp2.denovos[consequence != "missense_variant"])) * 100), " (",nrow(mecp2.denovos[data_source == "indelible"]), "/", nrow(mecp2.denovos[consequence != "missense_variant"]), ")")
+paste0("")
+
+paste0("----Discussion Stats----")
+paste0("Variants Identified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & (FILTER == "KNOWN" | FILTER == "REPORT")]))
+paste0("Novel variants identified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]))
+paste0("% increase in variants 21-500bp : ",sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100))
+paste0("Number of novel clinical actionable: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & `Is Pathogenic?` == T]) , "/",
+       nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]), " (", sprintf(sp.format, 100*(nrow(indelible_hits[FILTER != "OTHERSIDE" & `Is Pathogenic?` == T]) / 
+       nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "REPORT"]))), "%)")
+paste0("Proportion of all MECP2 (incl. missense) variants IDd by InDelible: ", sprintf(sp.format, (nrow(mecp2.denovos[data_source == "indelible"])/nrow(mecp2.denovos)) * 100), " (",nrow(mecp2.denovos[data_source == "indelible"]), "/", nrow(mecp2.denovos), ")")
+```

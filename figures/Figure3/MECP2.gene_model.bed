@@ -1,0 +1,2 @@
+chrom	start	end	transcript	qual	strand	cdsStart	cdsEnd	qual.2	numExons	exonLengths	exonStarts	geneID
+X	153295684	153363177	ENST00000453960	0	-	153295817	153363122	0	3	1217,351,117,	0,1973,67376,	ENSG00000169057
