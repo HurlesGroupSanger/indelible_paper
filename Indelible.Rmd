@@ -404,7 +404,7 @@ setnames(indelible.db, names(indelible.db), c("chr","pos","maf","AC","AP","mean.
 indelible.db[,cut.MAF:=cut(maf,breaks=1/(10^(0:5)))]
 indelible.db[,cov.cut:=cut(mean.cov, breaks = c(seq(0,100,by=10),max(mean.cov)), include.lowest = T)]
 indelible.db[,is.sv.resolved:=grepl("REALN|REPEAT",aln_mode,perl = T)]
-indelible.db[,length.cut:=cut(abs(size),breaks=c(0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
+indelible.db[,length.cut:=cut(abs(size),breaks=c(-1,0,1,2,3,4,5,6,10,20,50,100,500,10000,1000000000))]
 indelible.db[,dummy:=1]
 
 ```
@@ -937,7 +937,7 @@ print(paste0("Total number of ≤10bp InDels    : ",tot.small, " (",sprintf("%0.
 print(paste0("Total number of large CNVs      : ",tot.large, " (",sprintf("%0.01f",(tot.large/tot.vars)*100),"%)"))
 
 print(paste0("Sensitivity ≤10bp               : ",sprintf("%0.01f",sens[2:8,sum(known)/sum(total)*100])))
-print(paste0("Peak sensitivity (51-100bp)     : ",sprintf("%0.01f",sens[!is.na(sens),max(sens)]*100)))
+print(paste0("Peak sensitivity (21-50bp)     : ",sprintf("%0.01f",sens[!is.na(sens),max(sens)]*100)))
 print(paste0("# of variants 21-500bp          : ",sens[row >=10 & row <= 12,sum(indelible - known)]))
 print(paste0("% increase in variants 21-500bp : ",sprintf("%0.01f",(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100)))
 ```
@@ -1396,14 +1396,14 @@ ggsave("figures/Figure3/Figure3b.pdf",figure.4b,width=8,height=5,units="in")
 ```{r Figure 4, fig.height=3, fig.width=8}
 
 additive.plot <- ggplot(additive.table,aes(set,count,group=cat,fill=cat)) + 
-  geom_col(size=0.5,colour="black",alpha = 0.5) + 
+  geom_col(size=1,colour="black",alpha = 0.5) + 
   geom_text(data = pct.table,inherit.aes = F,aes(set,y+mod,label=paste0(n, " (", sprintf("%0.1f",pct),"%)"),hjust=just, colour = algo),fontface="bold") +
   geom_hline(aes(yintercept = additive.table[set == "InDelible + GATK + XHMM + MELT",sum(count)]), linetype = 2, colour = "red", size = 1) +
   coord_flip() + 
   scale_x_discrete(name = "", limits = rev(c("InDelible","InDelible + GATK","InDelible + GATK + XHMM","InDelible + GATK + XHMM + MELT")), labels = rev(c("InDelible","InDelible + GATK","InDelible + GATK +\nXHMM","InDelible + GATK +\nXHMM + MELT"))) +
   scale_y_continuous(name = "Total # of PTVs in Monoallelic\nDD Genes Among DDD Trios",breaks = c(0,400,800,1200,additive.table[set == "InDelible + GATK + XHMM + MELT",sum(count)]),expand=c(0,0),limits = c(0,1400)) +
   scale_alpha_continuous(range = c(0,1)) +
-  scale_fill_manual(values = col.pal.plot[,col], guide = guide_legend(title = "Calling Algorithm")) +
+  scale_fill_manual(values = c(col.pal.plot[1,col],col.pal.plot[2,col],col.pal.plot[10,col],col.pal.plot[4,col]), guide = guide_legend(title = "Calling Algorithm")) +
   scale_colour_manual(values = c("#7C9A81","#B77C0D"), guide = "none") +
   theme.legend + theme(panel.grid.major.x=element_line(colour="grey",size=1), axis.text.y=element_text(hjust=0.5))
 additive.plot
@@ -1660,7 +1660,7 @@ ggsave("figures/Supplement/SuppFig7.png", type.plot, width = 7.5, height = 6, dp
 ## Resolved length plot:
 size.plot <- ggplot(indelible.db[is.sv.resolved==T], aes(length.cut)) + 
   geom_histogram(stat="count",colour = "black", fill = col.palette[3], size = 1) + 
-  scale_x_discrete(name="Variant Length",labels=c("1","2","3","4","5","6","7-10","11-20","21-50","51-100","101-500","501-10,000","10,000+","Unknown")) + 
+  scale_x_discrete(name="Variant Length",labels=c("0","1","2","3","4","5","6","7-10","11-20","21-50","51-100","101-500","501-10,000","10,000+","Unknown")) + 
   scale_y_continuous(name = "Number of Clusters") +
   theme
 size.plot
@@ -1787,7 +1787,7 @@ paste0("Number of plausibly pathogenic variants in DECIPHER: ",sens[,sum(total)]
 paste0("Total number of ≤10bp InDels    : ",tot.small, " (",sprintf(sp.format,(sens[2:8,sum(total)]/sens[,sum(total)])*100),"%)")
 paste0("Total number of large CNVs      : ",tot.large, " (",sprintf(sp.format,(sens[14,total]/sens[,sum(total)])*100),"%)")
 paste0("Sensitivity ≤10bp               : ",sprintf(sp.format,sens[2:8,sum(known)/sum(total)*100]), "%")
-paste0("Peak sensitivity (51-100bp)     : ",sprintf(sp.format,sens[!is.na(sens),max(sens)]*100))
+paste0("Peak sensitivity (20-50)     : ",sprintf(sp.format,sens[!is.na(sens),max(sens)]*100))
 paste0("# of variants 21-500bp          : ",sens[row >=10 & row <= 12,sum(indelible - known)])
 paste0("% increase in variants 21-500bp : ",sprintf(sp.format,(sens[row >=10 & row <= 12,sum(indelible - known)]/sens[row >=10 & row <= 12,sum(total)])*100))
 paste0("Number of variants reidentified by InDelible: ", nrow(indelible_hits[FILTER != "OTHERSIDE" & FILTER == "KNOWN"]))
